@@ -1,0 +1,25 @@
+# build output
+openwrt/
+build_dir/
+bin/
+staging_dir/
+dl/
+*.o
+*.ko
+*.bin
+*.img
+*.gz
+*.xz
+
+# bench capture and local state
+artifacts/
+logs/
+__pycache__/
+*.pyc
+/tmp/
+
+# editors and OS
+.vscode/
+.idea/
+.DS_Store
+*~

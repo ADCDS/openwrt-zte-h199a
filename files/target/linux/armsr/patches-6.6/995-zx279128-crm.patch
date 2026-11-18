@@ -1,0 +1,27 @@
+--- a/drivers/clk/Kconfig
++++ b/drivers/clk/Kconfig
+@@ -502,6 +502,16 @@
+ source "drivers/clk/xilinx/Kconfig"
+ source "drivers/clk/zynqmp/Kconfig"
+ 
++config COMMON_CLK_ZX279128_CRM
++	bool "ZTE ZX279128S clock/reset manager"
++	depends on OF && ARCH_ZX279128
++	select RESET_CONTROLLER
++	help
++	  Clocks and resets of the ZX279128S CRM blocks: the SPI flash
++	  controller's divider and gates, the shared LSP0 parent gates and
++	  the PCIe controller resets. PLLs and source selection are left as
++	  the boot firmware set them, and every modelled gate stays on.
++
+ # Kunit test cases
+ config CLK_KUNIT_TEST
+ 	tristate "Basic Clock Framework Kunit Tests" if !KUNIT_ALL_TESTS
+--- a/drivers/clk/Makefile
++++ b/drivers/clk/Makefile
+@@ -135,3 +135,5 @@
+ obj-y					+= xilinx/
+ obj-$(CONFIG_ARCH_ZYNQ)			+= zynq/
+ obj-$(CONFIG_COMMON_CLK_ZYNQMP)         += zynqmp/
++
++obj-$(CONFIG_COMMON_CLK_ZX279128_CRM) += clk-zx279128-crm.o

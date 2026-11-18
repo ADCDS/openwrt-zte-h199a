@@ -1,0 +1,14 @@
+#!/bin/sh
+
+[ "$ACTION" = released ] && [ "$BUTTON" = wps ] || exit 0
+case "$SEEN" in ''|*[!0-9]*) exit 0;; esac
+[ "$SEEN" -lt 3 ] || exit 0
+. /lib/functions.sh
+case "$(board_name)" in
+zte,zx279128s|zte,zxhn-h199a) ;;
+*) exit 0 ;;
+esac
+
+# procd runs the standard rc.button handler first. This observer neither starts
+# nor cancels enrollment, and must not hold up the serialized hotplug queue.
+/usr/libexec/h199a-wps-led </dev/null >/dev/null 2>&1 &

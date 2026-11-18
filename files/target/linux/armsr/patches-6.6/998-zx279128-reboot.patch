@@ -1,0 +1,22 @@
+--- a/drivers/power/reset/Kconfig
++++ b/drivers/power/reset/Kconfig
+@@ -304,4 +304,12 @@
+ 	help
+ 	  This driver supports reset or low power mode handling for Mellanox BlueField.
+ 
++config POWER_RESET_ZX279128
++	tristate "ZTE ZX279128S system reset"
++	depends on OF && (ARCH_ZX279128 || COMPILE_TEST)
++	depends on HAS_IOMEM
++	help
++	  Restart the ZTE ZX279128S through its dedicated TOPCRM system
++	  reset trigger. This does not provide a watchdog or power-off.
++
+ endif
+--- a/drivers/power/reset/Makefile
++++ b/drivers/power/reset/Makefile
+@@ -36,3 +36,4 @@
+ obj-$(CONFIG_POWER_RESET_SC27XX) += sc27xx-poweroff.o
+ obj-$(CONFIG_NVMEM_REBOOT_MODE) += nvmem-reboot-mode.o
+ obj-$(CONFIG_POWER_MLXBF) += pwr-mlxbf.o
++obj-$(CONFIG_POWER_RESET_ZX279128) += zx279128-reboot.o

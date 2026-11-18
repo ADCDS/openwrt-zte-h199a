@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/sram/zte,zx279128s-smp-sram.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: ZTE ZX279128S on-chip SRAM region used for secondary CPU startup
+
+maintainers:
+  - TBD
+
+description: |
+  A child of the SoC's mmio-sram controller covering the window where the
+  BootROM parks CPU1 in a holding pen.
+
+  The "zte,zx279128s-smp" enable-method (arch/arm/mach-zx279128/platsmp.c)
+  finds this node with of_find_compatible_node(), maps its reg[0] through the
+  parent's ranges, copies a trampoline there and patches two words: +0x4 is
+  the physical address of secondary_startup and +0x8 the physical address of
+  the pen-release variable. CPU1 is then woken with SEV.
+
+  It is a child rather than a controller of its own because the hardware has
+  no SRAM controller to configure: the region is plain on-chip RAM that the
+  CPU can already read and write. Modelling it as mmio-sram plus a
+  SoC-specific child is the upstream form, and it replaces the vendor's
+  generic "zte,iram" compatible, which named no SoC and had no binding.
+
+properties:
+  compatible:
+    const: zte,zx279128s-smp-sram
+
+  reg:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false
+
+examples:
+  - |
+    sram@200800 {
+        compatible = "mmio-sram";
+        reg = <0x200800 0x1000>;
+        #address-cells = <1>;
+        #size-cells = <1>;
+        ranges = <0 0x200800 0x1000>;
+
+        smp-sram@0 {
+            compatible = "zte,zx279128s-smp-sram";
+            reg = <0x0 0x1000>;
+        };
+    };
+...

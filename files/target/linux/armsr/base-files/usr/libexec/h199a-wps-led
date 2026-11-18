@@ -1,0 +1,79 @@
+#!/bin/sh
+# Observe AP pushbutton enrollment; never log status JSON or peer addresses.
+set -eu
+umask 077
+led=/sys/class/leds/green:wps
+request=/var/run/h199a-wps-led.request
+
+uptime_seconds() {
+	local seconds rest
+	read -r seconds rest </proc/uptime || return 1
+	printf '%s\n' "${seconds%.*}"
+}
+
+query_active() {
+	local object state
+	for object in $(ubus -S -t 2 list 'hostapd.*' 2>/dev/null); do
+		state=$(ubus -S -t 2 call "$object" wps_status 2>/dev/null |
+			jsonfilter -e '@.pbc_status' 2>/dev/null) || continue
+		[ "$state" != Active ] || return 0
+	done
+	return 1
+}
+
+case "${1:-}" in
+--status) query_active; exit $? ;;
+'') ;;
+*) exit 64 ;;
+esac
+
+active() {
+	# ubus -t does not bound object lookup. Limit the entire child process
+	# group, including lookup and JSON parsing, before accepting its status.
+	/usr/libexec/timeout-coreutils -k 1 5 "$0" --status 2>/dev/null
+}
+
+[ -w "$led/trigger" ] && [ -w "$led/brightness" ] || exit 0
+active || exit 0
+printf '%s %s\n' "$(uptime_seconds)" "$$" >"$request.$$.new"
+mv -f "$request.$$.new" "$request"
+
+# A repeated press refreshes the existing observer's deadline. A short wait
+# also covers a previous observer that is already finishing its cleanup.
+# Keep the lock inode: unlinking it would permit competing LED writers.
+exec 9>/var/run/h199a-wps-led.lock
+/usr/bin/util-linux-flock -w 3 9 || exit 0
+
+clear_led() {
+	printf '%s\n' none >"$led/trigger" || :
+	printf '%s\n' 0 >"$led/brightness" || :
+}
+trap clear_led EXIT
+trap 'exit 0' INT TERM HUP
+lit=0
+while :; do
+	read -r started generation <"$request" || exit 0
+	case "$started" in ''|*[!0-9]*) exit 0;; esac
+	case "$generation" in ''|*[!0-9]*) exit 0;; esac
+	now=$(uptime_seconds)
+	# Standard PBC lasts 120s; leave a small margin, measured monotonically.
+	[ "$now" -ge "$started" ] && [ "$((now - started))" -lt 130 ] || exit 0
+	if active; then
+		if [ "$lit" = 0 ]; then
+			printf '%s\n' timer >"$led/trigger"
+			printf '%s\n' 200 >"$led/delay_on"
+			printf '%s\n' 100 >"$led/delay_off"
+			lit=1
+		fi
+	else
+		status=$?
+		# A new press may have arrived while a scan reported an older
+		# inactive state. Its distinct generation must not be lost if the
+		# follower's lock wait expired. A failed/timed-out query stops us.
+		[ "$status" = 1 ] || exit 0
+		read -r latest latest_generation <"$request" || exit 0
+		[ "$latest:$latest_generation" != "$started:$generation" ] && continue
+		exit 0
+	fi
+	sleep 2
+done

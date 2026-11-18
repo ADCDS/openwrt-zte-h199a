@@ -1,0 +1,168 @@
+#!/bin/sh
+# Production UBI overlay attach for the H199A.
+#
+# This is the de-gated counterpart of 79_h199a_overlay: it attaches the
+# overlay_ubi partition and lets OpenWrt's fstools mount ubi0:rootfs_data as the
+# overlay, WITHOUT the diagnostic-image preconditions (no ubi_test/write_test
+# module params, no bind/unbind suppression checks). It still refuses to format
+# an unexpected volume set. It acts ONLY in the production image, recognised by
+# the compiled write policy on the kernel command line; in every other image
+# (normal RAM qualification, diagnostic, production-policy qualification) it
+# returns immediately and touches nothing.
+#
+# /dev is not devtmpfs here, so nodes are created from sysfs device numbers.
+
+H199A_PROD_VIDOFFSET=2048
+H199A_PROD_LEBS=104
+H199A_PROD_NODES=/dev/h199a-prod-overlay
+
+h199a_prod_active() {
+	# Only the production kernel carries spi_zx279128.production=1 (the
+	# qualification kernel carries production_qualify=1 instead, and must not
+	# attach the real overlay).
+	grep -qw 'spi_zx279128.production=1' /proc/cmdline 2>/dev/null
+}
+
+h199a_prod_mtdnum() {
+	local p name
+	for p in /sys/class/mtd/mtd[0-9]*; do
+		[ -f "$p/name" ] || continue
+		read -r name < "$p/name"
+		if [ "$name" = overlay_ubi ]; then
+			echo "${p##*/mtd}"
+			return 0
+		fi
+	done
+	return 1
+}
+
+h199a_prod_node() { # <dir/name> <sysfs dev file>
+	local path="$1" devfile="$2" devid major minor
+	[ -e "$path" ] && return 0
+	[ -r "$devfile" ] || return 1
+	read -r devid < "$devfile"
+	major=${devid%:*}
+	minor=${devid#*:}
+	case "$major$minor" in *[!0-9]*) return 1;; esac
+	mknod "$path" c "$major" "$minor"
+}
+
+h199a_prod_recover() {
+	echo "H199A_PROD_OVERLAY_FAILED: $1; entering recovery console"
+	FAILSAFE=true
+	export FAILSAFE
+	pi_preinit_no_failsafe=n
+	touch /tmp/failsafe
+	boot_run_hook failsafe
+	# A failed preinit hook does not stop procd on its own. Block so normal
+	# services cannot start on top of an unknown overlay state.
+	while :; do sleep 3600; done
+}
+
+# Count the volumes on ubi<num> and report whether rootfs_data is present.
+h199a_prod_scan() { # <ubi_num> -> sets PROD_VOLS, PROD_HAS_ROOTFS, PROD_RD
+	local d n
+	PROD_VOLS=0
+	PROD_HAS_ROOTFS=0
+	PROD_RD=
+	for d in /sys/class/ubi/ubi$1_[0-9]*; do
+		[ -e "$d/name" ] || continue
+		PROD_VOLS=$((PROD_VOLS + 1))
+		read -r n < "$d/name"
+		if [ "$n" = rootfs_data ]; then
+			PROD_HAS_ROOTFS=1
+			PROD_RD=${d##*/}
+		fi
+	done
+}
+
+# True only if NO eraseblock of the window starts with the UBI erase-counter
+# magic "UBI#". A failed attach over an existing UBI image (bit errors, a wrong
+# VID offset, a transient driver error) must never be "repaired" by formatting:
+# that would silently destroy the owner's configuration. This is a UBI-marker check, not an all-bytes-erased check: arbitrary
+# non-UBI contents are not protected. First-install preflight must establish
+# that this reserved window is disposable. Unknown geometry or an
+# unreadable block refuses formatting.
+h199a_prod_window_blank() { # <mtdnum> <mtd node>
+	local size erase blocks i magic
+	read -r size < "/sys/class/mtd/mtd$1/size" 2>/dev/null || return 1
+	read -r erase < "/sys/class/mtd/mtd$1/erasesize" 2>/dev/null || return 1
+	case "$size$erase" in ''|*[!0-9]*) return 1;; esac
+	[ "$erase" -gt 0 ] && [ $((size % erase)) -eq 0 ] || return 1
+	blocks=$((size / erase))
+	i=0
+	while [ "$i" -lt "$blocks" ]; do
+		magic=$(dd if="$2" bs=4 count=1 skip=$((i * erase / 4)) 2>/dev/null) || return 1
+		[ "$magic" = 'UBI#' ] && return 1
+		i=$((i + 1))
+	done
+	return 0
+}
+
+h199a_prod_attach() {
+	local mtdnum ubidev ubinum
+	mtdnum=$(h199a_prod_mtdnum) || return 1
+
+	mkdir -m 700 -p "$H199A_PROD_NODES" || return 1
+	h199a_prod_node "$H199A_PROD_NODES/control" /sys/class/misc/ubi_ctrl/dev || return 1
+	h199a_prod_node "$H199A_PROD_NODES/mtd" "/sys/class/mtd/mtd$mtdnum/dev" || return 1
+
+	# Attach; a window without UBI EC markers may be formatted once. The
+	# operator must already have backed up and verified this window as disposable. A failed attach over an existing UBI image
+	# returns 3 so the caller enters recovery instead of destroying it.
+	if ! [ -d "/sys/class/ubi/ubi0" ] || \
+	   [ "$(cat /sys/class/ubi/ubi0/mtd_num 2>/dev/null)" != "$mtdnum" ]; then
+		ubiattach "$H199A_PROD_NODES/control" -p "$H199A_PROD_NODES/mtd" \
+			-d 0 -O "$H199A_PROD_VIDOFFSET" >/dev/null 2>&1
+	fi
+	if [ "$(cat /sys/class/ubi/ubi0/mtd_num 2>/dev/null)" != "$mtdnum" ]; then
+		h199a_prod_window_blank "$mtdnum" "$H199A_PROD_NODES/mtd" || return 3
+		echo "H199A_PROD_OVERLAY: blank overlay_ubi window; formatting once"
+		ubiformat "$H199A_PROD_NODES/mtd" -y >/dev/null 2>&1 || return 1
+		ubiattach "$H199A_PROD_NODES/control" -p "$H199A_PROD_NODES/mtd" \
+			-d 0 -O "$H199A_PROD_VIDOFFSET" >/dev/null 2>&1
+	fi
+	[ "$(cat /sys/class/ubi/ubi0/mtd_num 2>/dev/null)" = "$mtdnum" ] || return 1
+
+	h199a_prod_scan 0
+	if [ "$PROD_HAS_ROOTFS" = 0 ] && [ "$PROD_VOLS" != 0 ]; then
+		# Foreign volume(s) present but no rootfs_data: do NOT reformat.
+		return 2
+	fi
+	# PROD_HAS_ROOTFS may be 0 here only for a freshly formatted empty UBI;
+	# h199a_prod_overlay creates the volume in that case.
+	return 0
+}
+
+h199a_prod_make_vol() {
+	local ubidev=/dev/ubi0
+	h199a_prod_node "$ubidev" /sys/class/ubi/ubi0/dev || return 1
+	ubimkvol "$ubidev" -N rootfs_data -t dynamic -S "$H199A_PROD_LEBS" >/dev/null 2>&1
+}
+
+h199a_prod_overlay() {
+	h199a_prod_active || return 0
+
+	h199a_prod_attach
+	case $? in
+		0) ;;
+		2) h199a_prod_recover "unexpected volume on overlay_ubi (refusing to format)";;
+		3) h199a_prod_recover "overlay_ubi holds a UBI image that did not attach (refusing to format)";;
+		*) h199a_prod_recover "cannot attach overlay_ubi";;
+	esac
+
+	# Create rootfs_data if the fresh/empty window had none.
+	h199a_prod_scan 0
+	if [ "$PROD_HAS_ROOTFS" = 0 ]; then
+		h199a_prod_make_vol || h199a_prod_recover "cannot create rootfs_data volume"
+		h199a_prod_scan 0
+		[ "$PROD_HAS_ROOTFS" = 1 ] || h199a_prod_recover "rootfs_data volume missing after create"
+	fi
+
+	# Publish the volume char node so fstools can mount ubi0:rootfs_data.
+	h199a_prod_node "/dev/$PROD_RD" "/sys/class/ubi/$PROD_RD/dev" || \
+		h199a_prod_recover "cannot publish $PROD_RD device node"
+	echo "H199A_PROD_OVERLAY_READY: ubi0:rootfs_data available for mount_root"
+}
+
+boot_hook_add preinit_main h199a_prod_overlay

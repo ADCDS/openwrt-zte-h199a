@@ -1,0 +1,32 @@
+--- a/drivers/watchdog/Kconfig
++++ b/drivers/watchdog/Kconfig
+@@ -1047,4 +1047,17 @@
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called sunplus_wdt.
+
++config ZX279128_WATCHDOG
++	tristate "ZTE ZX279128S Cortex-A9 TWD watchdog"
++	depends on OF && (ARCH_ZX279128 || COMPILE_TEST)
++	depends on HAS_IOMEM
++	select WATCHDOG_CORE
++	help
++	  Watchdog driver for CPU0's bank of the Cortex-A9 private watchdog
++	  on the ZTE ZX279128S. Userspace keeps it alive through
++	  /dev/watchdog; the driver never feeds it on its own.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called zx279128_wdt.
++
+ # X86 (i386 + ia64 + x86_64) Architecture
+
+ config ACQUIRE_WDT
+--- a/drivers/watchdog/Makefile
++++ b/drivers/watchdog/Makefile
+@@ -99,5 +99,6 @@
+ obj-$(CONFIG_APPLE_WATCHDOG) += apple_wdt.o
+ obj-$(CONFIG_SUNPLUS_WATCHDOG) += sunplus_wdt.o
+ obj-$(CONFIG_MARVELL_GTI_WDT) += marvell_gti_wdt.o
++obj-$(CONFIG_ZX279128_WATCHDOG) += zx279128_wdt.o
+
+ # X86 (i386 + ia64 + x86_64) Architecture
+ obj-$(CONFIG_ACQUIRE_WDT) += acquirewdt.o

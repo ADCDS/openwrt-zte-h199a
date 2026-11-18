@@ -1,0 +1,21 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+/*
+ * ZTE ZXHN H199A - production-policy RAM qualification (NOT for flashing).
+ *
+ * Same partition table and flags as the production layout, booted from a RAM
+ * root with spi_zx279128.production_qualify=1, so bank A is flagged writable
+ * at the MTD layer but every bank-A program/erase is refused by the transport.
+ *
+ * The partitioned master stays writable here on purpose: it is the only path
+ * by which a real program/erase request can reach the transport's compiled
+ * allowlist (layer 2) past the read-only partitions (layer 1). Exercise that
+ * path only on blocks a fresh backup shows erased, as docs/INSTALL.md says.
+ */
+
+#include "zx279128s-zte-h199a-production.dts"
+
+&{/soc/spi@94406000/flash@0} {
+	/delete-property/ partitioned-master-read-only;
+	/* RAM-root qualification has no NAND boot selection to authenticate. */
+	/delete-property/ zte,bank-aware;
+};

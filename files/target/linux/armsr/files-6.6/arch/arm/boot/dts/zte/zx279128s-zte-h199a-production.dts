@@ -1,0 +1,68 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+/*
+ * ZTE ZXHN H199A - production NAND layout; active bank selected before probing.
+ *
+ * Identical hardware description to zx279128s-zte-h199a.dts; only the flash
+ * permissions differ. This is protection layer 1 of 2. The native transport's
+ * compiled physical allowlist (CONFIG_SPI_ZX279128_PRODUCTION_POLICY,
+ * spi_zx279128.production=1) is layer 2 and cannot be widened from here.
+ *
+ * Logical kernel1/rootfs/header follow the validated bootloader-selected
+ * bank; kernel2/rootfs2/header2 name its read-only peer. Only the active
+ * firmware and overlay_ubi are writable; the whole-flash master is not.
+ * Physical ranges and ordering do not move. Original mtd1..12 remain in
+ * place, overlay_ubi is mtd13, and the added physical B header is mtd14.
+ *
+ * `staging` [0x5000000,0x6400000) CONTAINS the UBI window. Never erase it as
+ * a sysupgrade staging area again; see docs/INSTALL.md.
+ */
+
+#include "zx279128s-zte-h199a.dts"
+
+&{/soc/spi@94406000/flash@0} {
+	/delete-property/ read-only;
+	/* Withdraws write permission from mtd0 after the partitions inherited
+	 * it (CONFIG_MTD_SPI_NAND_FAIL_STOP); there is no writable path around
+	 * the read-only partitions below.
+	 */
+	partitioned-master-read-only;
+	/* The validated vendor boot selection moves active labels/permissions
+	 * before the flash controller probes. Physical ranges stay unchanged.
+	 */
+	zte,bank-aware;
+};
+
+&{/soc/spi@94406000/flash@0/partitions/partition@a00000} {
+	/* Bank A is the initial root marker; boot-bank.c moves it to the
+	 * selected bank before probing. The active rootfs stays writable for the
+	 * mtd character device (sysupgrade); CONFIG_MTD_BLOCK=n removes the
+	 * read-modify-write block layer, and CONFIG_MTD_BLOCK_RO provides the
+	 * read-only block device for the root mount.
+	 */
+	linux,rootfs;
+};
+
+&{/soc/spi@94406000/flash@0/partitions/partition@4000000} {
+	label = "legacy_overlay";
+	read-only;
+};
+
+&{/soc/spi@94406000/flash@0/partitions/partition@5000000} {
+	read-only;
+};
+
+&{/soc/spi@94406000/flash@0/partitions} {
+	/* Appended after the original twelve, so it is mtd13. Attached by
+	 * lib/preinit/78_h199a_production_overlay, never automatically.
+	 */
+	partition@5400000 {
+		label = "overlay_ubi";
+		reg = <0x5400000 0x1000000>;
+	};
+	/* Append after overlay_ubi to preserve its existing mtd13 number. */
+	partition@3020000 {
+		label = "header2";
+		reg = <0x3020000 0x20000>;
+		read-only;
+	};
+};

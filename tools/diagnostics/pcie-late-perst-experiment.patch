@@ -1,0 +1,85 @@
+--- a/drivers/pci/controller/dwc/pcie-zx279128.c
++++ b/drivers/pci/controller/dwc/pcie-zx279128.c
+@@ -534,6 +534,42 @@
+ 	return 0;
+ }
+ 
++/* Private one-shot control, before either PCI host or DMA user exists. */
++static int zx_pcie_retry_after_clocks(struct zx_pcie *pair)
++{
++	u32 value;
++	int i, ret = 0, error;
++
++	/* Stop and verify BOTH LTSSMs before any new falling reset edge. */
++	for (i = 0; i < 2; i++) {
++		value = readl(pair[i].glue + ZX_GLUE_CTRL);
++		writel(value & ~ZX_GLUE_LTSSM_EN, pair[i].glue + ZX_GLUE_CTRL);
++		if ((readl(pair[i].glue + ZX_GLUE_CTRL) & ZX_GLUE_LTSSM_EN) && !ret)
++			ret = -EIO;
++	}
++	if (ret)
++		goto release_both;
++	for (i = 0; i < 2; i++) {
++		ret = zx_perst_set(&pair[i], true);
++		if (ret)
++			goto release_both;
++	}
++	mdelay(100);
++release_both:
++	/* Never short-circuit cleanup, even if an assertion or release failed. */
++	for (i = 0; i < 2; i++) {
++		error = zx_perst_set(&pair[i], false);
++		if (error && !ret)
++			ret = error;
++	}
++	if (ret)
++		return ret;
++	mdelay(200);
++	for (i = 0; i < 2; i++)
++		zx_pcie_train(&pair[i]);
++	return 0;
++}
++
+ static int zx_pcie_start_link(struct dw_pcie *pci)
+ {
+ 	/* Both domains and PERST lines are already prepared. Never reset the
+@@ -721,7 +757,7 @@
+ 	struct zx_pcie *pair;
+ 	u32 port, seen = 0, missing = 0;
+ 	int i, ret = 0;
+-	bool legacy, hold_perst = zx_hold_perst;
++	bool legacy, hold_perst = zx_hold_perst, late_retry = false;
+ 
+ 	mutex_lock(&zx_prepare_lock);
+ 	if (zx_prepare_state != ZX_PREPARE_NEW) {
+@@ -752,6 +788,8 @@
+ 			goto put_node;
+ 		}
+ 		port = ret;
++		if (!port)
++			late_retry = of_property_read_bool(np, "zte,late-perst-retry");
+ 		seen |= BIT(port);
+ 		pair[port].port = port;
+ 		pair[port].serdes_override = !port &&
+@@ -838,6 +876,21 @@
+ 		if (zx_pcie_wait_l0(&pair[i]))
+ 			missing |= BIT(i);
+ 	}
++	if (late_retry && (missing & BIT(0))) {
++		dev_info(dev, "private one-shot late PERST after stable clocks; missing=%#x\n", missing);
++		ret = zx_pcie_retry_after_clocks(pair);
++		if (ret) {
++			zx_prepare_error = ret;
++			dev_err(dev, "late PERST readback failed: %d\n", ret);
++			goto unmap;
++		}
++		missing = 0;
++		for (i = 0; i < 2; i++) {
++			if (zx_pcie_wait_l0(&pair[i]))
++				missing |= BIT(i);
++		}
++		dev_info(dev, "late PERST retry complete; missing=%#x\n", missing);
++	}
+ 	/* All shared writes are complete. A missing endpoint must not disable
+ 	 * the healthy peer. DWC gates child configuration access on link_up
+ 	 * and its later retraining never repeats our GPIO/shared reset writes.

@@ -1,0 +1,38 @@
+--- a/arch/arm/Kconfig
++++ b/arch/arm/Kconfig
+@@ -316,6 +316,23 @@
+ 	select CPU_V7M
+ 	select NO_IOPORT_MAP
+ 
++config ARCH_ZX279128
++	bool "ZTE/Sanechips ZX279128S"
++	depends on ARCH_MULTIPLATFORM && CPU_V7
++	select ARM_GLOBAL_TIMER
++	select ARM_ERRATA_754322
++	select ARM_ERRATA_764369 if SMP
++	select HAVE_ARM_SCU if SMP
++	help
++	  Support for the ZTE/Sanechips ZX279128S, a dual Cortex-A9 SoC used in
++	  the ZTE ZXHN H199A Ethernet router.
++
++	  Selects the SCU and the ARM global timer, which this SoC needs and
++	  which a generic multiplatform configuration does not enable on its
++	  own, and builds the secondary-core bring-up in
++	  arch/arm/mach-zx279128/ - the SoC has no PSCI implementation and
++	  brings its second core up through a vendor IRAM holding pen.
++
+ config ARCH_MMAP_RND_BITS_MIN
+ 	default 8
+ 
+--- a/arch/arm/Makefile
++++ b/arch/arm/Makefile
+@@ -241,6 +241,9 @@
+ 
+ # If we have a machine-specific directory, then include it in the build.
+ core-y				+= $(patsubst %,arch/arm/mach-%/,$(machine-y))
++
++# ZTE ZX279128S secondary-core bring-up (multiplatform, no machine-y entry).
++core-$(CONFIG_ARCH_ZX279128)	+= arch/arm/mach-zx279128/
+ # For cleaning
+ core-				+= $(patsubst %,arch/arm/mach-%/,$(machine-))
+ 

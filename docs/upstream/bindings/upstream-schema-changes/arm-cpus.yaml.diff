@@ -1,0 +1,10 @@
+--- a/Documentation/devicetree/bindings/arm/cpus.yaml
++++ b/Documentation/devicetree/bindings/arm/cpus.yaml
+@@ -246,6 +246,7 @@
+           - ste,dbx500-smp
+           - ti,am3352
+           - ti,am4372
++          - zte,zx279128s-smp
+ 
+   cpu-release-addr:
+     oneOf:

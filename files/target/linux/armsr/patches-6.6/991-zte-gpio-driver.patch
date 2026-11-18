@@ -1,0 +1,25 @@
+--- a/drivers/gpio/Kconfig
++++ b/drivers/gpio/Kconfig
+@@ -766,5 +766,14 @@
+ 	help
+ 	  Say yes here to support the GPIO controller in LSI ZEVIO SoCs.
+
++config GPIO_ZX279128
++	bool "ZTE/Sanechips ZX279128S GPIO support"
++	depends on ARM
++	help
++	  Say yes here to support the GPIO controller found on ZTE/Sanechips
++	  ZX279128S SoCs (e.g. the ZXHN H199A), which drives the front-panel
++	  LEDs and the reset and WPS buttons. Six banks of sixteen pins with
++	  no interrupt support.
++
+ config GPIO_ZYNQ
+ 	tristate "Xilinx Zynq GPIO support"
+ 	depends on ARCH_ZYNQ || ARCH_ZYNQMP
+--- a/drivers/gpio/Makefile
++++ b/drivers/gpio/Makefile
+@@ -196,3 +196,4 @@
+ obj-$(CONFIG_GPIO_ZEVIO)		+= gpio-zevio.o
++obj-$(CONFIG_GPIO_ZX279128)		+= gpio-zx279128.o
+ obj-$(CONFIG_GPIO_ZYNQ)			+= gpio-zynq.o
+ obj-$(CONFIG_GPIO_ZYNQMP_MODEPIN)	+= gpio-zynqmp-modepin.o

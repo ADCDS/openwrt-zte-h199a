@@ -1,0 +1,108 @@
+From: Adriel <adriel@adriel.eu>
+Subject: [PATCH] zx279128-eth: wire ndo_setup_tc to the PP hardware offload glue
+
+The hardware flow offload path lives in zx279128-pp-offload.c (gated by
+CONFIG_ZX279128_PP_OFFLOAD). It is self-contained and inert until the per-port
+netdev ops expose ndo_setup_tc and the offload glue is given a way to map a
+net_device to a hardware switch-port index. This patch adds exactly that seam
+to zx279128-eth.c and nothing else:
+
+  - zx_port_hw_index(): a net_device -> switch-port index resolver (only the
+    per-port netdevs are switch ports; everything else returns -1), wrapped in
+    a struct zx_pp_offload_dev_ops;
+  - zx_port_setup_tc(): the .ndo_setup_tc body, which forwards to
+    zx_pp_offload_setup_tc(ze->pp, ...);
+  - the dev_ops handover after the PP table init block in probe;
+  - a per-port flush (zx_pp_offload_port_down) on ndo_stop, before the datapath
+    is torn down.
+
+All hunks are behind #ifdef CONFIG_ZX279128_PP_OFFLOAD, so with the symbol off
+this is a no-op and the driver is byte for byte unchanged. Delivered as a patch
+rather than applied directly because zx279128-eth.c is owned by the
+datapath-reset work; apply after that lands and rebuild.
+
+Generated against zx279128-eth.c at commit fa4dcca. If the
+file has changed under the hunks, regenerate it; tests/test_pp_offload.py
+(PpOffloadEthHookupTests) fails if it no longer applies.
+
+--- a/files/target/linux/armsr/files-6.6/drivers/net/ethernet/zte/zx279128-eth.c
++++ b/files/target/linux/armsr/files-6.6/drivers/net/ethernet/zte/zx279128-eth.c
+@@ -37,6 +37,9 @@
+ #include <linux/slab.h>
+ 
+ #include "zx279128-pp.h"
++#ifdef CONFIG_ZX279128_PP_OFFLOAD
++#include <net/pkt_cls.h>	/* enum tc_setup_type */
++#endif
+ 
+ static u32 sp_last_alloc_raw;	/* debug: last BM+0x0c value seen */
+ 
+@@ -2460,16 +2463,55 @@
+ 		phy_disconnect(ndev->phydev);
+ 	}
+ 	zx_mac_enable(pp->ze, pp->port, false);
++#ifdef CONFIG_ZX279128_PP_OFFLOAD
++	/* Drop any hardware flows that ingress/egress this port before the
++	 * datapath stops; safe if nothing was offloaded and safe if called
++	 * twice (docs/PP-OFFLOAD.md teardown).
++	 */
++	zx_pp_offload_port_down(pp->ze->pp, ndev);
++#endif
+ 	zx_dp_stop(pp->ze);
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_ZX279128_PP_OFFLOAD
++/* Map a per-port netdev to its hardware switch-port index for the offload
++ * glue (zx279128-pp-offload.c). Only the per-port netdevs are switch ports;
++ * the DT-bound primary netdev and anything else return -1, so a flow touching
++ * them stays in the software datapath.
++ */
++static int zx_port_hw_index(const struct net_device *ndev)
++{
++	if (ndev->netdev_ops != &zx_port_netdev_ops)
++		return -1;
++	return ((struct zx_port_priv *)netdev_priv(ndev))->port;
++}
++
++static const struct zx_pp_offload_dev_ops zx_pp_offload_dev_ops = {
++	.port_index = zx_port_hw_index,
++};
++
++/* ndo_setup_tc: hand the TC_SETUP_FT / block setup to the offload glue. Inert
++ * (returns -EOPNOTSUPP) when table access is off or the tables are not live.
++ */
++static int zx_port_setup_tc(struct net_device *ndev, enum tc_setup_type type,
++			    void *type_data)
++{
++	struct zx_eth *ze = ((struct zx_port_priv *)netdev_priv(ndev))->ze;
++
++	return zx_pp_offload_setup_tc(ze->pp, ndev, type, type_data);
++}
++#endif /* CONFIG_ZX279128_PP_OFFLOAD */
++
+ static const struct net_device_ops zx_port_netdev_ops = {
+ 	.ndo_open = zx_port_open,
+ 	.ndo_stop = zx_port_stop,
+ 	.ndo_start_xmit = zx_eth_xmit,
+ 	.ndo_set_mac_address = eth_mac_addr,
+ 	.ndo_validate_addr = eth_validate_addr,
++#ifdef CONFIG_ZX279128_PP_OFFLOAD
++	.ndo_setup_tc = zx_port_setup_tc,
++#endif
+ };
+ 
+ static void zx_phy_node_put(void *node)
+@@ -4536,6 +4578,12 @@
+ 	else
+ 		dev_info(dev, "pp: no bring-up by this probe; table access disabled\n");
+ #endif
++#ifdef CONFIG_ZX279128_PP_OFFLOAD
++	/* Hand the offload glue the port-index seam once the PP tables are
++	 * (possibly) live; a NULL ze->pp just leaves the offload inert.
++	 */
++	zx_pp_offload_set_dev_ops(ze->pp, &zx_pp_offload_dev_ops);
++#endif
+ 
+ 	ndev->netdev_ops = &zx_eth_netdev_ops;
+ 	netif_napi_add(ndev, &ze->napi, zx_eth_poll);

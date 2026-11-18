@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/reset/zte,zx279128s-reboot.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: ZTE ZX279128S system reset trigger
+
+maintainers:
+  - Adriel Santos <adriel@adriel.eu>
+
+description: |
+  A dedicated word at TOPCRM offset 0x44 requests a system reset when
+  written with 1. The driver must use an unconditional ordered write;
+  the register is not a generic read/modify/write control word.
+
+properties:
+  compatible:
+    const: zte,zx279128s-reboot
+
+  reg:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false
+
+examples:
+  - |
+    reset-controller@94000044 {
+        compatible = "zte,zx279128s-reboot";
+        reg = <0x94000044 0x4>;
+    };

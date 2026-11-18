@@ -1,0 +1,129 @@
+#!/bin/sh
+# Guarded normal-userspace qualification. The build profile supplies the marker
+# and private DT partition; ordinary read-only diagnostic images do not attach.
+
+h199a_overlay_check() {
+	local original i p count name
+	[ "$(cat /sys/module/spi_zx279128/parameters/ubi_test 2>/dev/null)" = Y ] || return 1
+	[ "$(cat /sys/module/spi_zx279128/parameters/write_test 2>/dev/null)" = N ] || return 1
+	[ "$(cat /sys/module/spinand/parameters/diagnostic_write_guard 2>/dev/null)" = Y ] || return 1
+	[ -d /sys/bus/spi/drivers/spi-nand ] || return 1
+	[ ! -e /sys/bus/spi/drivers/spi-nand/bind ] || return 1
+	[ ! -e /sys/bus/spi/drivers/spi-nand/unbind ] || return 1
+	[ -d /sys/bus/platform/drivers/zx279128-spifc ] || return 1
+	[ ! -e /sys/bus/platform/drivers/zx279128-spifc/bind ] || return 1
+	[ ! -e /sys/bus/platform/drivers/zx279128-spifc/unbind ] || return 1
+	[ "$(cat /sys/class/mtd/mtd0/flags)" = 0x400 ] || return 1
+	[ "$(cat /sys/class/mtd/mtd0/size)" = 134217728 ] || return 1
+	original='bootloader tag wifi usercfg defcfg kernel1 rootfs header kernel2 rootfs2 legacy_overlay staging'
+	i=1
+	for name in $original; do
+		[ "$(cat /sys/class/mtd/mtd$i/name)" = "$name" ] || return 1
+		[ "$(cat /sys/class/mtd/mtd$i/flags)" = 0x0 ] || return 1
+		i=$((i + 1))
+	done
+	p=/sys/class/mtd/mtd13
+	[ "$(cat $p/name)" = overlay_ubi ] || return 1
+	[ "$(cat $p/flags)" = 0x400 ] || return 1
+	[ "$(cat $p/offset)" = 88080384 ] || return 1
+	[ "$(cat $p/size)" = 16777216 ] || return 1
+	[ "$(cat $p/erasesize)" = 131072 ] || return 1
+	[ "$(cat $p/writesize)" = 2048 ] || return 1
+	[ "$(cat $p/oobsize)" = 128 ] || return 1
+	[ "$(cat $p/type)" = nand ] || return 1
+	[ "$(cat $p/dev)" = 90:26 ] || return 1
+	count=0
+	for p in /sys/class/mtd/mtd[0-9]*; do
+		[ -f "$p/flags" ] || continue
+		count=$((count + 1))
+	done
+	[ "$count" -eq 14 ] || return 1
+	for p in /sys/class/ubi/ubi[0-9]*; do
+		[ ! -e "$p" ] || return 1
+	done
+	grep -qw ubifs /proc/filesystems || return 1
+}
+
+h199a_overlay_attach() {
+	local device p count volume major minor
+	h199a_overlay_check || return 1
+	# procd mounts /tmp nodev. Use a fresh private directory on /dev instead.
+	[ ! -e /dev/h199a-overlay ] || return 1
+	mkdir -m 700 /dev/h199a-overlay || return 1
+	mknod /dev/h199a-overlay/mtd c 90 26 || return 1
+	device=$(cat /sys/class/misc/ubi_ctrl/dev) || return 1
+	major=${device%:*}
+	minor=${device#*:}
+	[ "$major" = 10 ] || return 1
+	case "$minor" in ''|*[!0-9]*) return 1;; esac
+	mknod /dev/h199a-overlay/control c "$major" "$minor" || return 1
+	chmod 600 /dev/h199a-overlay/mtd /dev/h199a-overlay/control || return 1
+	ubiattach /dev/h199a-overlay/control -p /dev/h199a-overlay/mtd -d 0 -O 2048 || return 1
+	[ "$(cat /sys/class/ubi/ubi0/mtd_num)" = 13 ] || return 1
+	count=0
+	for p in /sys/class/ubi/ubi0_[0-9]*; do
+		[ -e "$p/name" ] || continue
+		count=$((count + 1))
+		[ "$(cat "$p/name")" = rootfs_data ] || return 1
+		[ "$(cat "$p/type")" = dynamic ] || return 1
+		[ "$(cat "$p/reserved_ebs")" = 104 ] || return 1
+		volume=${p##*/}
+		[ "$volume" = ubi0_0 ] || return 1
+		device=$(cat "$p/dev") || return 1
+		major=${device%:*}
+		minor=${device#*:}
+		case "$major" in ''|*[!0-9]*) return 1;; esac
+		case "$minor" in ''|*[!0-9]*) return 1;; esac
+		if [ ! -e "/dev/$volume" ]; then
+			mknod "/dev/$volume" c "$major" "$minor" || return 1
+		fi
+		[ -c "/dev/$volume" ] || return 1
+	done
+	[ "$count" -eq 1 ] || return 1
+	# fstools must perform the first mount and UNKNOWN/PENDING/READY transition.
+	echo 'H199A_OVERLAY_READY: guarded UBI volume available for mount_root'
+}
+
+h199a_overlay_failed() {
+	echo 'H199A_OVERLAY_FAILED: storage qualification stopped; use the recovery console'
+	FAILSAFE=true
+	export FAILSAFE
+	pi_preinit_no_failsafe=n
+	touch /tmp/failsafe
+	boot_run_hook failsafe
+	# preinit hook return codes and a failed preinit exit do not stop procd.
+	# Keep this process alive so normal services cannot start after a failed gate.
+	while :; do sleep 3600; done
+}
+
+h199a_overlay_preinit() {
+	[ -f /etc/h199a-overlay-qualification ] || return 0
+	H199A_OVERLAY_QUALIFICATION=1
+	h199a_overlay_attach || h199a_overlay_failed
+}
+
+h199a_overlay_mount_check() {
+	[ "$(cat /sys/class/ubi/ubi0/mtd_num)" = 13 ] || return 1
+	[ "$(cat /sys/class/ubi/ubi0_0/name)" = rootfs_data ] || return 1
+	awk '
+	$2 == "/overlay" && $3 == "ubifs" && $4 ~ /(^|,)rw(,|$)/ &&
+	    ($1 == "/dev/ubi0_0" || $1 == "ubi0:rootfs_data") { upper++ }
+	$2 == "/" && $3 == "overlay" && $4 ~ /(^|,)rw(,|$)/ &&
+	    $4 ~ /(^|,)upperdir=\/overlay\/upper(,|$)/ &&
+	    $4 ~ /(^|,)workdir=\/overlay\/work(,|$)/ { merged++ }
+	$2 == "/rom" && $3 == "squashfs" && $4 ~ /(^|,)ro(,|$)/ { lower++ }
+	END { exit !(upper == 1 && merged == 1 && lower == 1) }
+	' /proc/mounts || return 1
+	# The qualification lower filesystem must be the RAM disk, not old NAND.
+	awk '$3 == "1:0" && $5 == "/rom" { found++ } END { exit found != 1 }' \
+		/proc/self/mountinfo || return 1
+}
+
+h199a_overlay_post_mount() {
+	[ "$H199A_OVERLAY_QUALIFICATION" = 1 ] || return 0
+	h199a_overlay_mount_check || h199a_overlay_failed
+	echo 'H199A_OVERLAY_MOUNTED: verified UBIFS upper and SquashFS RAM lower'
+}
+
+boot_hook_add preinit_main h199a_overlay_preinit
+boot_hook_add preinit_mount_root h199a_overlay_post_mount

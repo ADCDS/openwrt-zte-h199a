@@ -1,0 +1,1013 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+/*
+ * ZTE ZXHN H199A Ethernet router — ZX279128S (dual Cortex-A9)
+ *
+ * First-light bring-up DTS for mainline Linux 6.6 via OpenWrt armsr/armv7.
+ *
+ * The ZX279128S has no mainline platform support. This DTS uses only
+ * generic multiplatform IP blocks present on the SoC (GIC, PL011, A9
+ * global timer, PL310 L2), with FIXED clocks at the values inherited
+ * from cspboot/U-Boot — no clock driver needed to reach a shell:
+ *
+ *   uartclk    25 MHz   measured live from the PL011 divisor registers
+ *                       (IBRD=13 FBRD=36 @ 115200 → 16×13.5625×115200 ≈ 25 MHz;
+ *                       26/104 MHz parents would give IBRD 14/56 — ruled out)
+ *   periphclk  500 MHz  stock kernel log: "sched_clock: 64 bits at 500MHz"
+ *                       (= CPU 1 GHz / 2), feeds the A9 global timer
+ *   apb_pclk   125 MHz  AMBA bus gate clock, always-on with fixed clocks
+ *
+ * Source of truth for addresses/IRQs: the stock DTB extracted from the
+ * firmware dump (repo/extracted/h199a-stock.dts, sha256 d5611520…).
+ *
+ * Secondary CPU startup uses the port's "zte,zx279128s-smp" platform support.
+ */
+
+/dts-v1/;
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/clock/zte,zx279128s-crm.h>
+#include <dt-bindings/reset/zte,zx279128s-crm.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+
+/ {
+	model = "ZTE ZXHN H199A";
+	/* Most specific first, as the device-tree convention requires: the board,
+	 * then the SoC, then the family. OpenWrt derives /tmp/sysinfo/board_name
+	 * from the first entry, so every consumer accepts both the board and the
+	 * SoC string - an image built before this change still validates, and a
+	 * unit already running this one keeps working after it.
+	 */
+	compatible = "zte,zxhn-h199a", "zte,zx279128s", "zte,zx279128";
+
+	#address-cells = <1>;
+	#size-cells = <1>;
+	interrupt-parent = <&gic>;
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+		/* Replaced by the decompressor only after validating the vendor's
+		 * selected-bank BootPara; 0xffffffff means unavailable (RAM boot).
+		 */
+		zte,boot-bank = <0xffffffff>;
+		/* appended to the bootloader cmdline via
+		 * CONFIG_ARM_ATAG_DTB_COMPAT_CMDLINE_EXTEND (cspstart
+		 * overrides env bootargs from in-flash BootPara) */
+		bootargs = "earlycon=zteuart,0x94404000 ignore_loglevel";
+	};
+
+	aliases {
+		spi0 = &spifc;
+		serial0 = &uart0;
+		serial1 = &uart1;
+		led-boot = &led_power;
+		led-failsafe = &led_power;
+		led-running = &led_power;
+		led-upgrade = &led_power;
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		enable-method = "zte,zx279128s-smp";	/* arch/arm/mach-zx279128 */
+
+		cpu@0 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a9";
+			reg = <0>;
+			next-level-cache = <&l2cc>;
+		};
+
+		cpu@1 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a9";
+			reg = <1>;
+			next-level-cache = <&l2cc>;
+		};
+	};
+
+	/* The Ethernet datapath's hardware buffer manager hands out 2 KiB
+	 * buffers addressed as 0x41000000 + (index << 11); the index is 11 bits
+	 * (< 2048), so the pool spans 4 MiB. Linux must not allocate here.
+	 * This is the only carve-out of the 128 MiB below: the forced
+	 * CONFIG_CMDLINE has no mem=, there are no /memreserve/ entries, and
+	 * the platform code reserves nothing (the stock kernel's top 18 MiB
+	 * at 0x46e00000 are ordinary RAM here).
+	 */
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		/* Whole datapath window, the ethernet node's memory-region.
+		 * The TM registers point at several DDR regions: pool
+		 * 0x41000000 (TMC+0xf4), 0x41400000 (TMC+0xf8),
+		 * 0x41800000/0x41808000 (TMC+0xe8/0xec), RX ring 0x41a00000
+		 * (TMC+0xf0), and 0x41b00000/0x41c00000 (TMQ+0x50/0x60).
+		 * Reserve the lot so Linux never allocates over any of them.
+		 * The driver programs these as offsets from this base and
+		 * needs the full 16 MiB, 1 MiB aligned, no-map (it ioremaps
+		 * the parts it touches).
+		 */
+		eth_bufs: eth-datapath@41000000 {
+			reg = <0x41000000 0x01000000>;
+			no-map;
+		};
+
+	};
+
+	memory@40000000 {
+		device_type = "memory";
+		reg = <0x40000000 0x08000000>; /* 128 MiB DDR */
+	};
+
+	clocks {
+		osc25m: clock-25m {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-frequency = <25000000>;
+		};
+
+		uartclk: clock-uart {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-frequency = <25000000>;
+		};
+
+		spifc_ref: clock-spifc-ref {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			/* Boot-configured pll_lsp / 10, verified stock clock model. */
+			clock-frequency = <100000000>;
+		};
+
+		apb_pclk: clock-apb {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-frequency = <125000000>;
+		};
+
+		periphclk: clock-periph {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-frequency = <500000000>;
+		};
+	};
+
+	/* Buttons and LEDs.
+	 *
+	 * Pin assignments come from the stock kernel's own descriptor tables:
+	 * a button array giving RESET = 39 and WPS = 41, and an LED array
+	 * naming each of the pins below. GetKeyGPIO returns the INVERSE of the
+	 * pin level, so both buttons are active low.
+	 *
+	 * Visual tests confirmed all eight declared LED channels active low.
+	 * GPIO48 had no observed effect on the faint red WPS indicator and is
+	 * intentionally omitted until its physical behavior is established.
+	 */
+	keys {
+		compatible = "gpio-keys-polled";
+		poll-interval = <20>;
+
+		key-reset {
+			label = "reset";
+			gpios = <&gpio 39 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_RESTART>;
+		};
+
+		key-wps {
+			label = "wps";
+			gpios = <&gpio 41 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_WPS_BUTTON>;
+		};
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		/* Labels and active-low polarity verified on the physical board. */
+		led_power: led-power-green {
+			label = "green:power";
+			gpios = <&gpio 8 GPIO_ACTIVE_LOW>;
+			default-state = "on";
+		};
+
+		led-power-red {
+			label = "red:power";
+			gpios = <&gpio 38 GPIO_ACTIVE_LOW>;
+		};
+
+		led-wan-green {
+			label = "green:wan";
+			gpios = <&gpio 12 GPIO_ACTIVE_LOW>;
+		};
+
+		led-wan-red {
+			label = "red:wan";
+			gpios = <&gpio 10 GPIO_ACTIVE_LOW>;
+		};
+
+		led-lan {
+			label = "green:lan";
+			gpios = <&gpio 49 GPIO_ACTIVE_LOW>;
+		};
+
+		led-wlan2g {
+			label = "green:wlan2g";
+			gpios = <&gpio 51 GPIO_ACTIVE_LOW>;
+		};
+
+		led-wlan5g {
+			label = "green:wlan5g";
+			gpios = <&gpio 60 GPIO_ACTIVE_LOW>;
+		};
+
+		led-wps-green {
+			label = "green:wps";
+			gpios = <&gpio 50 GPIO_ACTIVE_LOW>;
+		};
+		/* GPIO 48 had no visible effect in isolated low/high trials.
+		 * The faint red WPS indicator remains unmapped; do not claim a
+		 * working red channel from an inferred vendor-table label.
+		 */
+	};
+
+	soc {
+		compatible = "simple-bus";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		gic: interrupt-controller@801000 {
+			compatible = "arm,cortex-a9-gic";
+			#interrupt-cells = <3>;
+			#address-cells = <0>;
+			interrupt-controller;
+			reg = <0x00801000 0x1000>,
+			      <0x00800100 0x0100>;
+		};
+
+		timer@800200 {
+			compatible = "arm,cortex-a9-global-timer";
+			reg = <0x00800200 0x20>;
+			interrupts = <GIC_PPI 11 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&periphclk>;
+		};
+
+		/* Watchdog half of the A9 TWD (TWD base 0x800600 + 0x20). The
+		 * stock DT gives the global timer and this node the same clock
+		 * specifier, so both use periphclk. The registers are banked per
+		 * CPU and the driver programs only CPU0's bank. PPI 14 and the CPU0
+		 * mask match the stock DT. The interrupt is not requested, because
+		 * watchdog mode resets directly. See docs/WATCHDOG.md.
+		 */
+		/* SoC compatible first: this driver is SoC-specific (it banks the
+		 * watchdog to CPU0 with smp_call_function_single), so it must not
+		 * claim the generic ARM compatible as its primary match. The generic
+		 * string stays as the fallback, which is also what lets the node
+		 * validate against arm,twd-wdt.yaml.
+		 */
+		watchdog@800620 {
+			compatible = "zte,zx279128s-wdt", "arm,cortex-a9-twd-wdt";
+			reg = <0x00800620 0x20>;
+			interrupts = <GIC_PPI 14 (GIC_CPU_MASK_SIMPLE(1) | IRQ_TYPE_EDGE_RISING)>;
+			clocks = <&periphclk>;
+		};
+
+		/* On-chip SRAM used as the SMP trampoline area: the kernel copies
+		 * a pen-release stub here, patches in the secondary entry and
+		 * pen_release physical addresses, then wakes CPU1 with sev.
+		 *
+		 * Modelled as a generic mmio-sram controller with a SoC-specific
+		 * child, which is the upstream form: the old "zte,iram" was a bare
+		 * compatible with no SoC in the name and no sram binding behind it.
+		 * platsmp.c looks the child up by compatible, not the parent, so the
+		 * region stays the only thing it can map.
+		 */
+		iram: sram@200800 {
+			compatible = "mmio-sram";
+			reg = <0x200800 0x1000>;
+			#address-cells = <1>;
+			#size-cells = <1>;
+			ranges = <0 0x200800 0x1000>;
+
+			smp_sram: smp-sram@0 {
+				compatible = "zte,zx279128s-smp-sram";
+				reg = <0x0 0x1000>;
+			};
+		};
+
+		l2cc: l2-cache-controller@c00000 {
+			compatible = "arm,pl310-cache";
+			reg = <0x00c00000 0x1000>;
+			cache-unified;
+			cache-level = <2>;
+			arm,data-latency = <2 2 2>;
+			arm,tag-latency = <2 2 2>;
+			/* IOCC is enabled before coherent PCI DMA consumers probe. */
+			arm,io-coherent;
+			/* Match the verified stock PL310 policy before cache enable. */
+			arm,shared-override;
+			prefetch-data = <1>;
+			prefetch-instr = <1>;
+			arm,double-linefill = <1>;
+			arm,double-linefill-incr = <0>;
+			/* NOTE: arm,full-line-zero-disable was tried here to
+			 * chase SMP SQUASHFS corruption and made it WORSE
+			 * (21 errors vs 5 with FLZ on). Left enabled.
+			 */
+		};
+
+		iocc: coherency@a20000 {
+			compatible = "zte,zx279128s-iocc";
+			reg = <0x00a20000 0x1000>;
+		};
+
+		/* console UART (ttyAMA0) — ZTE ZX PL011 variant:
+		 * PL011-like with moved registers (DR@0x04, FR@0x14; IBRD/FBRD
+		 * at standard 0x24/0x28). Needs vendor_zte + zteuart earlycon
+		 * (patches-6.6/998). No AMBA PIDs in hardware → invented ID. */
+		uart0: serial@94404000 {
+			compatible = "zte,zx279128s-uart", "arm,pl011", "arm,primecell";
+			arm,primecell-periphid = <0x001feffe>;
+			reg = <0x94404000 0x1000>;
+			interrupts = <GIC_SPI 11 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&uartclk>, <&apb_pclk>;
+			clock-names = "uartclk", "apb_pclk";
+			status = "okay";
+		};
+
+		/* SPI-NAND controller (proprietary spifc) — boot flash is a
+		 * Micron MT29F1G01ABAFDWB. Driver: spi-zx279128.c via spi-mem. */
+		/* MDIO bus reaching the four on-board GE PHYs.
+		 * Register map reverse-engineered from the vendor U-Boot
+		 * (+0x04 wdata, +0x08 rdata, +0x10 status, +0x14 ctrl).
+		 */
+		/* Ethernet datapath. reg[0] is the MAC window of the port the
+		 * primary netdev serves (MAC 0); the other entries are the
+		 * datapath blocks the driver maps, at the sizes it maps them.
+		 * The blocks are ioremapped, not claimed: the MDIO driver's
+		 * debug dump and the PP table code map some of them too. SPA
+		 * (0x921d4000) and the port attach block (0x921d9000) are
+		 * inside npp, as in the vendor's npp node. memory-region is
+		 * the DDR window the buffers, free lists and rings live in.
+		 */
+		eth0: ethernet@92200000 {
+			compatible = "zte,zx279128s-eth";
+			reg = <0x92200000 0x1000>,	/* MAC 0          */
+			      <0x92240000 0x1000>,	/* MAC 1          */
+			      <0x92280000 0x1000>,	/* MAC 2          */
+			      <0x922c0000 0x1000>,	/* MAC 3          */
+			      <0x92000000 0x1000>,	/* fabric reset   */
+			      <0x92040000 0x1000>,	/* global         */
+			      <0x921c0000 0x20000>,	/* NPP, SPA, attach */
+			      <0x92340000 0x1000>,	/* TM config      */
+			      <0x92344000 0x1000>,	/* TM desc release / queue table */
+			      <0x92348000 0x1000>,	/* buffer manager */
+			      <0x9234c000 0x1000>,	/* QMG            */
+			      <0x92350000 0x1000>,	/* TM queues      */
+			      <0x92380000 0x1000>,	/* PP             */
+			      <0x92388000 0x1000>,	/* SBRG (bridge)  */
+			      <0x9238c000 0x1000>,	/* CLA            */
+			      <0x923a0000 0x1000>;	/* PonPp          */
+			reg-names = "mac0", "mac1", "mac2", "mac3", "fabric", "glb",
+				    "npp", "tmc", "tmd", "bm", "qmg", "tmq", "pp",
+				    "sbrg", "cla", "ponpp";
+			phy-handle = <&phy0>;
+			phy-mode = "rgmii";
+			memory-region = <&eth_bufs>;
+			status = "okay";
+
+			/* TM dispatches CPU RX; IDM and PHY lines are separate. */
+			interrupts = <GIC_SPI 36 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 38 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 39 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 40 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 41 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 42 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "tm", "idm", "gephy0", "gephy1",
+					  "gephy2", "gephy3";
+
+			/* One node per physical GE port.
+			 *
+			 * The driver exposes a netdev per port (RX frames are
+			 * attributed by the ingress-port field the descriptor
+			 * carries) and each netdev drives its OWN PHY, so link
+			 * state, speed and the MAC speed programming are real
+			 * per port. Before this existed the driver attached
+			 * exactly one PHY and left the other three suspended,
+			 * which meant a cabled jack read "Link is Down" purely
+			 * because phylib had powered its PHY off - and the
+			 * datapath was dead if the cable was not on the one
+			 * bound port. `all_ports` does NOT compensate for that:
+			 * measured 2026-09-06, driver on mac1 with the cable on
+			 * mac2, ping was 100% loss in both directions.
+			 *
+			 * reg is the MAC index N, which is also the descriptor
+			 * ingress-port value minus one, and the PHY at MDIO
+			 * address 10+N (all three relationships measured).
+			 */
+			ethernet-ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				/* The unit owns four consecutive factory MACs in
+				 * `tag`. Records 0 and 1 belong to the two radios
+				 * (the stock web UI names them as the 2.4 GHz and
+				 * 5 GHz BSSIDs), so the Ethernet ports must not
+				 * also claim them or eth0 and the 2.4 GHz AP
+				 * would collide inside br-lan. eth0 (and so
+				 * br-lan) takes record 2 and the WAN jack, eth3,
+				 * takes record 3, so every externally visible
+				 * address is a genuine factory one. The LAN
+				 * member ports eth1 and eth2 are DERIVED from
+				 * record 2 by the driver. eth0 is the DT-bound
+				 * port, so it is probed first and record 2
+				 * stays the derivation base.
+				 *
+				 * The derivation is the vendor's own, copied from
+				 * how it numbers extra BSSIDs: set the
+				 * locally-administered bit and put the index in
+				 * byte 3's high nibble, so 02:00:00:00:00:05
+				 * becomes 06:20:84:1f:87:b5, :2f:, :3f:. That
+				 * stays inside address space this unit owns
+				 * instead of poaching the next serial number's.
+				 */
+				port@0 {
+					reg = <0>;
+					phy-handle = <&phy0>;
+					phy-mode = "rgmii";
+					nvmem-cells = <&macaddr_tag_2>;
+					nvmem-cell-names = "mac-address";
+				};
+
+				port@1 {
+					reg = <1>;
+					phy-handle = <&phy1>;
+					phy-mode = "rgmii";
+				};
+
+				port@2 {
+					reg = <2>;
+					phy-handle = <&phy2>;
+					phy-mode = "rgmii";
+				};
+
+				port@3 {
+					reg = <3>;
+					phy-handle = <&phy3>;
+					phy-mode = "rgmii";
+					nvmem-cells = <&macaddr_tag_3>;
+					nvmem-cell-names = "mac-address";
+				};
+			};
+		};
+
+		mdio: mdio@9a101000 {
+			compatible = "zte,zx279128s-mdio";
+			reg = <0x9a101000 0x18>;
+			/* The stock DT names lsp1crpm clock 1, fb_mdio_wclk. */
+			clocks = <&crm ZX_CRM_MDIO_PCLK>, <&crm ZX_CRM_MDIO_WCLK>;
+			clock-names = "pclk", "wclk";
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "okay";
+
+			/* The four on-board GE PHYs answer at MDIO addresses
+			 * 10-13 (verified by a probe-time bus scan; all report
+			 * PHY ID 84b9:5031).
+			 */
+			phy0: ethernet-phy@10 { reg = <10>; };
+			phy1: ethernet-phy@11 { reg = <11>; };
+			phy2: ethernet-phy@12 { reg = <12>; };
+			phy3: ethernet-phy@13 { reg = <13>; };
+		};
+
+		/* Six banks of sixteen pins, 0x40 apart. Recovered from the
+		 * vendor bootloader's gpiotest command and the stock kernel's
+		 * zte_gpio_* ksyms; the same registers pcie-zx279128.c drove
+		 * PERST# through before this node existed. PCIe PERST# (pins 53
+		 * and 55) now comes from the pcie nodes' reset-gpios.
+		 *
+		 * Pin muxing is a separate block (CRM2) that the bootloader
+		 * programs before Linux starts, so pins not already muxed to
+		 * GPIO by the bootloader will not respond here.
+		 */
+		gpio: gpio@94407000 {
+			compatible = "zte,zx279128s-gpio";
+			reg = <0x94407000 0x180>;
+			clocks = <&crm ZX_CRM_GPIO_PCLK>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			status = "okay";
+		};
+
+		reboot: reset-controller@94000044 {
+			compatible = "zte,zx279128s-reboot";
+			reg = <0x94000044 0x4>;
+		};
+
+		/* Clock/reset manager: TOPCRM, CRM1, LSP0CRPM and LSP1CRPM.
+		 * The driver maps these windows without claiming them - the
+		 * reboot node claims TOPCRM+0x44 and the PCIe nodes map TOPCRM
+		 * and CRM1 as well - and models only fields from the stock
+		 * kernel's clock tables that a node here uses: the SPI, GPIO
+		 * and MDIO clocks, the shared LSP0/LSP1 parent gates and the
+		 * PCIe resets in CRM1+0x74. Every gate it models is registered
+		 * critical, so none can be turned off.
+		 */
+		crm: clock-controller@94000000 {
+			compatible = "zte,zx279128s-crm";
+			reg = <0x94000000 0x1000>,
+			      <0x94100000 0x1000>,
+			      <0x94400000 0x1000>,
+			      <0x9a100000 0x1000>;
+			reg-names = "topcrm", "crm1", "lsp0crpm", "lsp1crpm";
+			clocks = <&spifc_ref>, <&apb_pclk>;
+			clock-names = "lsp0-wclk", "lsp0-pclk";
+			#clock-cells = <1>;
+			#reset-cells = <1>;
+		};
+
+		spifc: spi@94406000 {
+			compatible = "zte,zx279128s-spifc";
+			reg = <0x94406000 0x1000>;
+			interrupts = <GIC_SPI 13 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&crm ZX_CRM_SPI_PCLK>, <&crm ZX_CRM_SPI_WCLK>;
+			clock-names = "pclk", "wclk";
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "okay";
+
+			flash@0 {
+				compatible = "spi-nand";
+				reg = <0>;
+				spi-max-frequency = <50000000>;
+				spi-rx-bus-width = <2>;
+				/* Native read qualification: no unlock, program or erase. */
+				read-only;
+
+				partitions {
+					compatible = "fixed-partitions";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					partition@0 {
+						label = "bootloader";
+						reg = <0x0000000 0x0100000>;
+						read-only;
+					};
+					/* Per-unit factory data: serial number, the
+					 * stock SSIDs and Wi-Fi keys, and four MAC
+					 * addresses.
+					 *
+					 * The MACs are TLV records at 0x1e + 0x18*n,
+					 * each preceded by its two-byte index
+					 * (00 01, 01 01, 02 01, 03 01). Verified
+					 * against a full 128 MiB dump of one unit:
+					 * exactly four binary occurrences of the OUI
+					 * and no ASCII copies. On that unit they read
+					 * 02:00:00:00:00:03 .. :b6 - four sequential
+					 * addresses, one per GE port.
+					 *
+					 * This is the SINGLE source of truth for the
+					 * MAC. Do not add a second writer in board.d
+					 * or uci-defaults: two independent writers is
+					 * what made the address non-deterministic on
+					 * the dir842 port.
+					 */
+					partition@100000 {
+						compatible = "nvmem-cells";
+						label = "tag";
+						reg = <0x0100000 0x0100000>;
+						read-only;
+						#address-cells = <1>;
+						#size-cells = <1>;
+
+						macaddr_tag_0: macaddr@1e {
+							reg = <0x1e 0x6>;
+						};
+
+						macaddr_tag_1: macaddr@36 {
+							reg = <0x36 0x6>;
+						};
+
+						macaddr_tag_2: macaddr@4e {
+							reg = <0x4e 0x6>;
+						};
+
+						macaddr_tag_3: macaddr@66 {
+							reg = <0x66 0x6>;
+						};
+					};
+					wifi_cal: partition@200000 {
+						label = "wifi";
+						reg = <0x0200000 0x0100000>;
+						read-only;
+					};
+					partition@300000 {
+						label = "usercfg";
+						reg = <0x0300000 0x0200000>;
+						read-only;
+					};
+					partition@500000 {
+						label = "defcfg";
+						reg = <0x0500000 0x0200000>;
+						read-only;
+					};
+					partition@700000 {
+						label = "kernel1";
+						reg = <0x0700000 0x0300000>;
+					};
+					partition@a00000 {
+						label = "rootfs";
+						reg = <0x0a00000 0x0d20000>;
+						/* NOT marked read-only.
+						 *
+						 * Round 118 set `read-only` here to stop
+						 * CONFIG_MTD_BLOCK's read-modify-write from erasing
+						 * the squashfs tail (a write erases the whole 128 KiB
+						 * block and writes it back, leaving it ERASED if the
+						 * write-back fails). That worked, but `read-only`
+						 * clears MTD_WRITEABLE for the CHAR device too, so
+						 * `mtd write ... rootfs` fails with -EROFS and
+						 * sysupgrade cannot write the rootfs at all
+						 * (verified on hardware, round 141).
+						 *
+						 * The structural fix is to remove the RMW block
+						 * device instead: CONFIG_MTD_BLOCK=n with
+						 * CONFIG_MTD_BLOCK_RO=y. squashfs still gets a block
+						 * device, RMW becomes impossible rather than merely
+						 * forbidden, and the char device stays writable.
+						 * (drivers/mtd/Kconfig calls the caching a "danger".)
+						 */
+					};
+					/* Bank A's zteboot header: CRC32 of the kernel area at
+					 * +0x3c, of the fs area at +0x48, and a self-CRC at
+					 * +0xa4. Needs to be a partition so sysupgrade can
+					 * rewrite it (see base-files/lib/upgrade/platform.sh);
+					 * it is deliberately the LAST thing written, so a power
+					 * loss mid-upgrade leaves a CRC mismatch and the
+					 * bootloader falls back to the intact stock bank.
+					 */
+					partition@1720000 {
+						label = "header";
+						reg = <0x1720000 0x0020000>;
+					};
+					partition@2000000 {
+						label = "kernel2";
+						reg = <0x2000000 0x0300000>;
+						read-only;
+					};
+					partition@2300000 {
+						label = "rootfs2";
+						reg = <0x2300000 0x0d20000>;
+						read-only;
+					};
+					/* OpenWrt overlay.
+					 *
+					 * It must NOT live inside the `rootfs`
+					 * partition: the vendor image header carries a
+					 * CRC over that whole partition and the
+					 * bootloader checks it on every boot, so any
+					 * overlay write invalidates it and the board
+					 * silently falls back to the stock bank
+					 * (observed in rounds 86 and 97).
+					 *
+					 * The factory dump is erased from 0x3040000 to
+					 * the end of the 128 MiB device (last vendor
+					 * data is bank B's header at 0x3020000), so
+					 * this region is free and outside every CRC.
+					 */
+					partition@4000000 {
+						label = "rootfs_data";
+						reg = <0x4000000 0x1000000>;
+					};
+
+					/* Staging area for sysupgrade images.
+					 *
+					 * !! VERIFY THIS ON YOUR OWN DEVICE BEFORE USE !!
+					 * The region was confirmed erased on ONE unit
+					 * (firmware V9.1.1). Flash contents are NOT
+					 * identical across units - this device family
+					 * stores per-unit data in flash (serial number,
+					 * SSID and Wi-Fi key are all visible in mtd1) -
+					 * and a unit with different or upgraded firmware
+					 * may hold something here. See docs/INSTALL.md
+					 * for how to check before erasing.
+					 *
+					 * The datapath cannot carry a 17 MB transfer
+					 * (see docs/ETHERNET.md), so an image is placed
+					 * here from U-Boot over TFTP and read back from
+					 * Linux with dd. That makes sysupgrade testable
+					 * without needing the network to work.
+					 *
+					 * Verified safe against a full 128 MiB dump of
+					 * this device: 0x05000000-0x08000000 is 100.00%
+					 * erased. The neighbouring gap at 0x03000000 is
+					 * NOT free - it holds high-entropy vendor data -
+					 * and bank B lives at 0x02000000-0x03020000, so
+					 * neither may be used.
+					 */
+					partition@5000000 {
+						label = "staging";
+						reg = <0x5000000 0x1400000>;
+					};
+				};
+			};
+		};
+
+		/* PCIe port 0 - MediaTek MT7613BE (14c3:7663) Wi-Fi.
+		 *
+		 * The stock DT node is `pcie@10000000` with no `reg` at all,
+		 * which cannot work with the DesignWare host framework: it
+		 * requires a "config" reg region and hard-fails without one.
+		 * Addresses below were recovered by RE and verified on
+		 * hardware (docs/WIFI.md rounds 100-108).
+		 *
+		 * INTx: kernel 6.6's dw_pcie_host_init() does NOT build a
+		 * legacy IRQ domain - INTx is resolved by the PCI core from
+		 * this interrupt-map, so four entries and no subnode.
+		 */
+		pcie0: pcie@f000000 {
+			compatible = "zte,zx279128s-pcie";
+			device_type = "pci";
+			/* crm0..crm2 are the clock/reset blocks both ports
+			 * share (TOPCRM, CRM1, CRM2); the driver maps them
+			 * without claiming them and only the first port to
+			 * probe uses them. Both nodes must give the same
+			 * three windows. The dbi address tells the driver
+			 * which port a node is (0x0f000000 is port 0).
+			 */
+			reg = <0x0f000000 0x4000>,	/* DesignWare DBI      */
+			      <0x1c000000 0x100000>,	/* config aperture     */
+			      <0x09500000 0x1000>,	/* vendor glue         */
+			      <0x94000000 0x1000>,	/* CRM0 (TOPCRM)       */
+			      <0x94100000 0x1000>,	/* CRM1                */
+			      <0x94200000 0x1000>;	/* CRM2                */
+			reg-names = "dbi", "config", "app", "crm0", "crm1", "crm2";
+			/* PERST# of the MT7613BE slot. */
+			reset-gpios = <&gpio 53 GPIO_ACTIVE_LOW>;
+			/* Core reset, CRM1+0x74 bit 0. */
+			resets = <&crm ZX_CRM_RST_PCIE0>;
+			dma-coherent;
+
+			bus-range = <0x00 0xff>;
+			num-lanes = <1>;
+			/* Keep PCI core retraining within the driver's Gen1 limit. */
+			max-link-speed = <1>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+
+			/* MEM window: must NOT overlap the config aperture
+			 * above, or the CFG and MEM outbound iATU windows
+			 * fight and BAR reads return 0xffffffff.
+			 */
+			/* 0x08000000: vendor resource "pcie0 mem space" is
+			 * 0x10000000-0x17ffffff (128 MiB); we were advertising
+			 * 192 MiB, 64 MiB of which the hardware does not decode.
+			 */
+			ranges = <0x82000000 0 0x10000000  0x10000000  0 0x08000000>;
+
+			#interrupt-cells = <1>;
+			interrupt-map-mask = <0 0 0 7>;
+			/* ★ The stock DTS's four interrupts are NOT INTA-D of one
+			 * port. Sorted they are 59, 63, 74, 78, and 63->78 and
+			 * 59->74 are BOTH +15: they are TWO PORTS x TWO LINES,
+			 * interleaved exactly in the order the stock DTS lists them
+			 * (63, 78, 59, 74) = port0-A, port1-A, port0-B, port1-B.
+			 *
+			 * Measured 2026-09-06: with the MT7603E on port 1 failing
+			 * its MCU handshake and nobody servicing it, GICD_ISPENDR
+			 * showed exactly one unserviced line pending - ID 110, i.e.
+			 * SPI 78. Port 0's INTA (SPI 63, ID 95) was NOT pending,
+			 * because mt7615e services it. So SPI 78 is port 1's line,
+			 * and mapping it to port 0's was why the MT7603E's handler
+			 * never fired.
+			 *
+			 * INTC/INTD are unknown; a single-function endpoint uses
+			 * INTA, so they are aliased to the two known lines rather
+			 * than invented.
+			 */
+			interrupt-map = <0 0 0 1 &gic GIC_SPI 63 IRQ_TYPE_LEVEL_HIGH>,
+					<0 0 0 2 &gic GIC_SPI 59 IRQ_TYPE_LEVEL_HIGH>,
+					<0 0 0 3 &gic GIC_SPI 63 IRQ_TYPE_LEVEL_HIGH>,
+					<0 0 0 4 &gic GIC_SPI 59 IRQ_TYPE_LEVEL_HIGH>;
+			status = "okay";
+
+			/* MT7613BE (14c3:7663) on bus 1.
+			 *
+			 * Without calibration data mt76 falls back to 3 dBm, which is
+			 * far too weak to be usable. The vendor stores an mt76 EEPROM
+			 * blob at `wifi` partition + 0x20000 - it begins with the
+			 * chip id 0x7663 followed by the MAC 00:0c:43:26:60:00,
+			 * exactly the mt76 EEPROM layout.
+			 */
+			/* The endpoint sits on bus 1 behind the root port, so the DT
+			 * must mirror that: a node for the root port (bus 0, dev 0)
+			 * containing the device node. A flat wifi@0,0 directly under
+			 * the controller does not match, which is why mt76 fell back
+			 * to a random MAC and 3 dBm.
+			 */
+			pcie@0,0 {
+				reg = <0x0000 0 0 0 0>;
+				#address-cells = <3>;
+				#size-cells = <2>;
+				device_type = "pci";
+				ranges;
+
+				wifi@0,0 {
+					compatible = "mediatek,mt76";
+					reg = <0x0000 0 0 0 0>;
+					mediatek,mtd-eeprom = <&wifi_cal 0x20000>;
+					/* The calibration blob's MAC is
+					 * 00:0c:43:26:60:00 - a MediaTek default,
+					 * identical on every unit. The real one is
+					 * factory data in `tag`. The stock web UI
+					 * names it directly: "SSID5 (5GHz) ...
+					 * Endereco MAC 02:00:00:00:00:04", which is
+					 * tag record 1.
+					 */
+					nvmem-cells = <&macaddr_tag_1>;
+					nvmem-cell-names = "mac-address";
+				};
+			};
+		};
+
+		/* PCIe port 1 - expected to host the 2.4 GHz MediaTek MT7603E.
+		 *
+		 * The vendor ships two Wi-Fi modules (mt7603e_ap 2.4 GHz and
+		 * mtk7613e_ap 5 GHz) and the vendor driver mirrors every base
+		 * for a second port: DBI 0x0f100000, glue 0x09600000, MEM
+		 * window 0x20000000, second window 0x2c000000. Port 0 gave us
+		 * the MT7613BE; this brings up the other half.
+		 *
+		 * The CRM clock/reset sequence is shared and run once, by
+		 * whichever port probes first; PERST# for this port is GPIO 55
+		 * (reset-gpios below).
+		 */
+		pcie1: pcie@f100000 {
+			compatible = "zte,zx279128s-pcie";
+			device_type = "pci";
+			/* CONFIRMED from the vendor's named struct resource array at
+			 * 0xc05b2aa8:
+			 *   "pcie0 reg"       0x0f000000-0x0f003fff
+			 *   "pcie1 reg"       0x0f100000-0x0f103fff   <- this port
+			 *   "pcie0 mem space" 0x10000000-0x17ffffff
+			 *   "pcie1 mem space" 0x20000000-0x27ffffff
+			 * The MEM entries match the stock boot log exactly, so the
+			 * table is authoritative. Note the register window is
+			 * 0x4000, not 0x1000. The config aperture and glue base
+			 * below are still UNCONFIRMED mirror-guesses.
+			 */
+			/* ★ ALL THREE ADDRESSES ARE NOW CONFIRMED, read out of the
+			 * vendor kernel (ref/stock-vmlinux.bin). One function at
+			 * VA 0xc0015de0 makes six ioremap calls in a row - port 0
+			 * then port 1, stored into two per-port records 0x38 apart:
+			 *
+			 *   0xc0015f00  mov r0,#0x0f000000   DBI0
+			 *   0xc0015f34  mov r0,#0x09500000   GLUE0   <- known good
+			 *   0xc0015f48  mov r0,#0x1c000000   CONFIG0
+			 *   0xc0015f88  mov r0,#0x0f100000   DBI1
+			 *   0xc0015fb0  mov r0,#0x09600000   GLUE1   <- this port
+			 *   0xc0015fc4  mov r0,#0x2c000000   CONFIG1
+			 *
+			 * GLUE0 is the base this driver already drives on port 0,
+			 * so the port-1 value is anchored to something measured,
+			 * not mirrored by guesswork. The vendor maps config with
+			 * size 0x10000, not the 0x100000 we advertise.
+			 *
+			 * ✗ The earlier "0x09600000 does not decode" result is a
+			 * FALSE NEGATIVE. zx_pcie_probe_glue_bases() runs only from
+			 * PORT 0's probe, i.e. after port 0's CRM branch and never
+			 * after port 1's - so BIT(27) of CRM0[0x08], port 1's clock
+			 * enable, had never been set when that read was taken.
+			 * Measured 2026-09-06 on a live port-0 boot:
+			 * CRM0[0x08] = 0x1006ffff, and bit 27 is clear. The probe
+			 * read an unclocked block.
+			 */
+			reg = <0x0f100000 0x4000>,	/* DBI    (confirmed) */
+			      <0x2c000000 0x100000>,	/* config (confirmed) */
+			      <0x09600000 0x1000>,	/* glue   (confirmed) */
+			      <0x94000000 0x1000>,	/* CRM0, shared, see pcie0 */
+			      <0x94100000 0x1000>,	/* CRM1 */
+			      <0x94200000 0x1000>;	/* CRM2 */
+			reg-names = "dbi", "config", "app", "crm0", "crm1", "crm2";
+			/* PERST# of the MT7603E slot. */
+			reset-gpios = <&gpio 55 GPIO_ACTIVE_LOW>;
+			/* Core reset, CRM1+0x74 bit 3. */
+			resets = <&crm ZX_CRM_RST_PCIE1>;
+			dma-coherent;
+
+			bus-range = <0x00 0xff>;
+			num-lanes = <1>;
+			max-link-speed = <1>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+
+			/* 0x08000000: the vendor resource says this window is
+			 * 0x20000000-0x27ffffff (128 MiB). We were advertising
+			 * 192 MiB, i.e. 64 MiB the hardware does not decode.
+			 */
+			ranges = <0x82000000 0 0x20000000  0x20000000  0 0x08000000>;
+
+			/* ✗ dma-ranges was TRIED here and does NOT help. The theory
+			 * was that port 1's inbound ATU is left unprogrammed (the
+			 * DesignWare core sets one up only if dma-ranges exists),
+			 * which fit the symptom exactly: MMIO to the endpoint works,
+			 * and the first thing needing device->host DMA fails.
+			 * Adding `dma-ranges = <0x42000000 0 0x40000000 0x40000000
+			 * 0 0x08000000>` changed nothing - byte-identical failure,
+			 * "MCU message 01 (seq 1) timed out". Removed rather than
+			 * left in as unproven noise.
+			 */
+
+			#interrupt-cells = <1>;
+			interrupt-map-mask = <0 0 0 7>;
+			/* Port 1's lines: SPI 78 (INTA) and 74 (INTB) - the +15
+			 * mirrors of port 0's 63 and 59. SPI 78 is the line that was
+			 * measured pending and unserviced while the MT7603E sat in
+			 * its failed MCU handshake. See the note on pcie0.
+			 */
+			interrupt-map = <0 0 0 1 &gic GIC_SPI 78 IRQ_TYPE_LEVEL_HIGH>,
+					<0 0 0 2 &gic GIC_SPI 74 IRQ_TYPE_LEVEL_HIGH>,
+					<0 0 0 3 &gic GIC_SPI 78 IRQ_TYPE_LEVEL_HIGH>,
+					<0 0 0 4 &gic GIC_SPI 74 IRQ_TYPE_LEVEL_HIGH>;
+			/* ★ ENABLED AND WORKING 2026-09-06. Port 1 trains, and the
+			 * MT7603E 2.4 GHz radio behind it enumerates:
+			 *
+			 *   /sys/bus/pci/devices/ -> 0000:00:00.0 0000:01:00.0
+			 *                            0001:00:00.0 0001:01:00.0
+			 *   0001:01:00.0 vendor:device = 0x14c3:0x7603  (MT7603E)
+			 *   mt7603e 0001:01:00.0: ASIC revision: 76030010
+			 *   mt7603e 0001:01:00.0: Firmware Version: ...
+			 *
+			 * Three things had to be true at once, and only the last
+			 * was missing: the confirmed glue base above, the port-1
+			 * clock/reset writes actually landing (they always did),
+			 * and the CONTIGUOUS CLOCK TRIPLE in CRM0[0x08] - port 0
+			 * enables bits 13/14/15 and port 1 needs 25/26/27, where
+			 * the driver used to set only bit 27. See pcie-zx279128.c.
+			 *
+			 * History, so nobody re-runs it.
+			 *
+			 * History, so nobody re-runs it: round 120 enabled this
+			 * node and the board hung at the first DBI access with an
+			 * imprecise external abort. That was WITH 0x09600000 as the
+			 * app entry, so the address is not what changed - what
+			 * changed is the understanding of why the probe read it as
+			 * dead (see the reg comment: port 1's clock enable had
+			 * never run). If this still wedges, the next suspects are
+			 * the two resets port 1's branch never performs -
+			 * CRM1[0x74] BIT(0) and CRM2[0x0c] BIT(14) - which port 0
+			 * clears in its FIRST phase and port 1 only ever sets.
+			 *
+			 * Test this with a TFTP RAM boot before flashing it: an
+			 * imprecise external abort here wedges the CPU with no oops
+			 * and needs a power cycle.
+			 */
+			status = "okay";
+
+			/* MT7603 uses a 512-byte base from the owner's stock rootfs
+			 * plus factory trim bytes from OTP. build.sh supplies the
+			 * validated base through a generated private include.
+			 * The factory MAC comes from tag record 0.
+			 */
+			pcie@0,0 {
+				reg = <0x0000 0 0 0 0>;
+				#address-cells = <3>;
+				#size-cells = <2>;
+				device_type = "pci";
+				ranges;
+
+				wifi2g: wifi@0,0 {
+					compatible = "mediatek,mt76";
+					reg = <0x0000 0 0 0 0>;
+					mediatek,eeprom-merge-otp;
+					nvmem-cells = <&macaddr_tag_0>;
+					nvmem-cell-names = "mac-address";
+				};
+			};
+
+		};
+
+		/* second UART, unpopulated header — keep for later */
+		uart1: serial@94405000 {
+			compatible = "zte,zx279128s-uart", "arm,pl011", "arm,primecell";
+			arm,primecell-periphid = <0x001feffe>;
+			reg = <0x94405000 0x1000>;
+			interrupts = <GIC_SPI 12 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&uartclk>, <&apb_pclk>;
+			clock-names = "uartclk", "apb_pclk";
+			status = "disabled";
+		};
+	};
+};
+
+/*
+ * Deliberately absent for first light (added one per bring-up phase):
+ *   - denali NAND @0xd80000 (needs its wclk; hand-off via fixed 125M first)
+ *   - the unmodelled CRM fields, CRM2 included (fixed clocks suffice now)
+ *   - PCIe @0x10000000 (Wi-Fi MT7603/MT7613 — mt76 drivers exist mainline)
+ *   - gephy/switch, PON blocks, dwc2/dwc3 USB, I2C, SSP, temp sensor
+ * Stock DTB equivalents live in repo/extracted/h199a-stock.dts as reference.
+ */

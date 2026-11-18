@@ -1,0 +1,160 @@
+CONFIG_ALIGNMENT_TRAP=y
+CONFIG_ARCH_32BIT_OFF_T=y
+CONFIG_ARCH_MIGHT_HAVE_PC_PARPORT=y
+CONFIG_ARCH_MMAP_RND_BITS=8
+CONFIG_ARCH_MULTIPLATFORM=y
+# CONFIG_ARCH_MULTI_V4 is not set
+# CONFIG_ARCH_MULTI_V4T is not set
+CONFIG_ARCH_MULTI_V6_V7=y
+CONFIG_ARCH_MULTI_V7=y
+CONFIG_ARCH_NR_GPIO=0
+CONFIG_ARCH_OPTIONAL_KERNEL_RWX=y
+CONFIG_ARCH_OPTIONAL_KERNEL_RWX_DEFAULT=y
+CONFIG_ARCH_SELECT_MEMORY_MODEL=y
+CONFIG_ARCH_VIRT=y
+CONFIG_ARM=y
+CONFIG_ARM_CPU_SUSPEND=y
+CONFIG_ARM_HAS_SG_CHAIN=y
+CONFIG_ARM_HEAVY_MB=y
+# CONFIG_ARM_HIGHBANK_CPUIDLE is not set
+CONFIG_ARM_L1_CACHE_SHIFT=6
+CONFIG_ARM_L1_CACHE_SHIFT_6=y
+# CONFIG_ARM_LPAE is not set
+CONFIG_ARM_PATCH_IDIV=y
+CONFIG_ARM_PATCH_PHYS_VIRT=y
+CONFIG_ARM_PSCI=y
+CONFIG_ARM_THUMB=y
+CONFIG_ARM_UNWIND=y
+CONFIG_ARM_VIRT_EXT=y
+CONFIG_AUTO_ZRELADDR=y
+CONFIG_BINFMT_FLAT_ARGVP_ENVP_ON_STACK=y
+CONFIG_CACHE_L2X0=y
+CONFIG_COMPAT_32BIT_TIME=y
+CONFIG_CPU_32v6K=y
+CONFIG_CPU_32v7=y
+CONFIG_CPU_ABRT_EV7=y
+CONFIG_CPU_CACHE_V7=y
+CONFIG_CPU_CACHE_VIPT=y
+CONFIG_CPU_COPY_V6=y
+CONFIG_CPU_CP15=y
+CONFIG_CPU_CP15_MMU=y
+# CONFIG_CPU_DCACHE_WRITETHROUGH is not set
+CONFIG_CPU_HAS_ASID=y
+CONFIG_CPU_PABRT_V7=y
+CONFIG_CPU_SPECTRE=y
+CONFIG_CPU_THUMB_CAPABLE=y
+CONFIG_CPU_TLB_V7=y
+CONFIG_CPU_V7=y
+CONFIG_CRYPTO_LIB_BLAKE2S_GENERIC=y
+CONFIG_DEBUG_LL_INCLUDE="mach/debug-macro.S"
+CONFIG_DMA_OPS=y
+CONFIG_EDAC_ATOMIC_SCRUB=y
+CONFIG_GENERIC_IRQ_MULTI_HANDLER=y
+CONFIG_GENERIC_VDSO_32=y
+CONFIG_HARDEN_BRANCH_PREDICTOR=y
+CONFIG_HAVE_SMP=y
+CONFIG_HZ_FIXED=0
+CONFIG_HZ_PERIODIC=y
+CONFIG_MIGHT_HAVE_CACHE_L2X0=y
+CONFIG_MODULES_USE_ELF_REL=y
+# CONFIG_NEON is not set
+CONFIG_NR_CPUS=4
+CONFIG_OLD_SIGACTION=y
+CONFIG_OLD_SIGSUSPEND3=y
+CONFIG_OUTER_CACHE=y
+CONFIG_OUTER_CACHE_SYNC=y
+CONFIG_PAGE_OFFSET=0xC0000000
+CONFIG_PERF_USE_VMALLOC=y
+CONFIG_PHYS_OFFSET=0
+CONFIG_RTC_MC146818_LIB=y
+CONFIG_SERIAL_OF_PLATFORM=y
+CONFIG_SMP_ON_UP=y
+CONFIG_SWP_EMULATE=y
+CONFIG_SYS_SUPPORTS_APM_EMULATION=y
+CONFIG_UNCOMPRESS_INCLUDE="debug/uncompress.h"
+CONFIG_UNWINDER_ARM=y
+# CONFIG_UNWINDER_FRAME_POINTER is not set
+CONFIG_USE_OF=y
+# CONFIG_VFP is not set
+# CONFIG_VFPv3 is not set
+CONFIG_XZ_DEC_ARM=y
+CONFIG_XZ_DEC_BCJ=y
+CONFIG_ZBOOT_ROM_BSS=0x0
+CONFIG_ZBOOT_ROM_TEXT=0x0
+# SMP: arch/arm/mach-zx279128 brings CPU1 up (SCU + iram trampoline + pen
+# release). NOTE this must be set in the SUBTARGET config - the subtarget file
+# is applied after target/linux/armsr/config-6.6 and would otherwise override
+# it back to "not set". SMP is ENABLED: both cores are brought up and maxcpus=1
+# is no longer set on the cmdline
+# on the cmdline; see docs/BRINGUP.md.
+CONFIG_SMP=y
+# --- H199A size trim: drop ARM64-server/virt drivers the SoC doesn't use ---
+# CONFIG_EFI is not set
+# CONFIG_EFI_STUB is not set
+# CONFIG_EFI_ESRT is not set
+# CONFIG_EFI_GENERIC_STUB is not set
+# CONFIG_EFI_ARMSTUB_DTB_LOADER is not set
+# CONFIG_EFI_RUNTIME_WRAPPERS is not set
+# CONFIG_EFI_PARAMS_FROM_FDT is not set
+# CONFIG_EFI_PARTITION is not set
+# CONFIG_EFIVAR_FS is not set
+# CONFIG_VIRTIO is not set
+# CONFIG_VIRTIO_BLK is not set
+# CONFIG_VIRTIO_NET is not set
+# CONFIG_VIRTIO_CONSOLE is not set
+# CONFIG_VIRTIO_PCI is not set
+# CONFIG_VIRTIO_MMIO is not set
+# CONFIG_VIRTIO_BALLOON is not set
+# CONFIG_NVME_CORE is not set
+# CONFIG_SCSI is not set
+# CONFIG_SCSI_VIRTIO is not set
+# CONFIG_SATA_AHCI is not set
+# CONFIG_SATA_AHCI_PLATFORM is not set
+# CONFIG_USB is not set
+# CONFIG_USB_XHCI_HCD is not set
+# CONFIG_USB_STORAGE is not set
+# CONFIG_USB_HID is not set
+# CONFIG_HID is not set
+# CONFIG_HID_GENERIC is not set
+# CONFIG_INPUT is not set
+# CONFIG_BPF is not set
+# CONFIG_BPF_SYSCALL is not set
+# CONFIG_BPF_JIT is not set
+# CONFIG_EXT4_FS is not set
+# CONFIG_F2FS_FS is not set
+# CONFIG_KALLSYMS_UNCOMPRESSED is not set
+
+# Serialise squashfs decompression. With CONFIG_SMP=y the kernel otherwise
+# selects DECOMP_MULTI_PERCPU, which issues concurrent reads into the spifc
+# NAND driver and reproduces the read errors documented in docs/BRINGUP.md
+# (init dies with "Error loading shared library ...: I/O error").
+CONFIG_SQUASHFS_COMPILE_DECOMP_SINGLE=y
+# CONFIG_SQUASHFS_COMPILE_DECOMP_MULTI is not set
+# CONFIG_SQUASHFS_COMPILE_DECOMP_MULTI_PERCPU is not set
+CONFIG_SQUASHFS_DECOMP_SINGLE=y
+# CONFIG_SQUASHFS_DECOMP_MULTI_PERCPU is not set
+
+# Trim subsystems this board does not have. The validated hand-tuned kernel had
+# these off and logged zero SQUASHFS read errors; the untrimmed recipe kernel
+# logs ~27 (non-fatal). Fewer subsystems probing concurrently with NAND reads
+# also keeps the kernel inside the 3 MiB flash partition.
+# (PCI is deliberately left enabled - the Wi-Fi part sits behind a PCIe root
+# complex, see docs/WIFI.md.)
+# CONFIG_USB_SUPPORT is not set
+# CONFIG_SCSI is not set
+# CONFIG_ATA is not set
+# CONFIG_INPUT is not set
+# CONFIG_NET_VENDOR_INTEL is not set
+# CONFIG_NET_VENDOR_BROADCOM is not set
+# CONFIG_NET_VENDOR_MELLANOX is not set
+# CONFIG_NET_VENDOR_MARVELL is not set
+# CONFIG_NET_VENDOR_MICROCHIP is not set
+# CONFIG_NET_VENDOR_STMICRO is not set
+# CONFIG_NET_VENDOR_AMAZON is not set
+# CONFIG_NET_VENDOR_AQUANTIA is not set
+
+# Do not split a second "rootfs_data" out of the tail of the rootfs partition.
+# That partition is covered by the vendor image CRC which the bootloader checks
+# every boot, so an overlay written there makes the board fall back to the stock
+# bank. The overlay is a dedicated partition at 0x4000000 instead - see the DTS.
+# CONFIG_MTD_SPLIT_SQUASHFS_ROOT is not set

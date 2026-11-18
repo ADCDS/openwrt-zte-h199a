@@ -1,0 +1,28 @@
+--- a/drivers/pci/controller/dwc/Kconfig
++++ b/drivers/pci/controller/dwc/Kconfig
+@@ -3,6 +3,15 @@
+ menu "DesignWare-based PCIe controllers"
+ 	depends on PCI
+ 
++config PCIE_ZX279128
++	bool "ZTE ZX279128S PCIe controller"
++	depends on OF && ARCH_ZX279128
++	select PCIE_DW_HOST
++	help
++	  Enable the DesignWare-based PCIe host controller found on the
++	  ZTE/Sanechips ZX279128S SoC (ZXHN H199A). Required for the
++	  on-board MediaTek Wi-Fi.
++
+ config PCIE_DW
+ 	bool
+ 
+--- a/drivers/pci/controller/dwc/Makefile
++++ b/drivers/pci/controller/dwc/Makefile
+@@ -2,6 +2,7 @@
+ obj-$(CONFIG_PCIE_DW) += pcie-designware.o
+ obj-$(CONFIG_PCIE_DW_HOST) += pcie-designware-host.o
+ obj-$(CONFIG_PCIE_DW_EP) += pcie-designware-ep.o
++obj-$(CONFIG_PCIE_ZX279128) += pcie-zx279128.o
+ obj-$(CONFIG_PCIE_DW_PLAT) += pcie-designware-plat.o
+ obj-$(CONFIG_PCIE_BT1) += pcie-bt1.o
+ obj-$(CONFIG_PCI_IMX6) += pci-imx6.o

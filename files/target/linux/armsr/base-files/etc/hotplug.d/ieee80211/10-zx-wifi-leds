@@ -1,0 +1,32 @@
+#!/bin/sh
+
+[ "$ACTION" = add ] || exit 0
+. /lib/functions.sh
+case "$(board_name)" in
+zte,zx279128s|zte,zxhn-h199a) ;;
+*) exit 0 ;;
+esac
+
+# phy indices depend on module order and change after radio re-registration.
+# Identify the physical radio by PCI device ID before binding its activity LED.
+phy="${DEVPATH##*/}"
+[ -n "$phy" ] || exit 0
+radio="/sys/class/ieee80211/$phy/device"
+[ "$(cat "$radio/vendor" 2>/dev/null)" = "0x14c3" ] || exit 0
+case "$(cat "$radio/device" 2>/dev/null)" in
+0x7603) led=green:wlan2g ;;
+0x7663) led=green:wlan5g ;;
+*) exit 0 ;;
+esac
+
+trigger="/sys/class/leds/$led/trigger"
+[ -w "$trigger" ] || exit 0
+# The wiphy add event can precede mac80211 registering its LED triggers.
+for attempt in 1 2 3; do
+	if grep -qw "${phy}tpt" "$trigger"; then
+		echo "${phy}tpt" > "$trigger"
+		exit 0
+	fi
+	sleep 1
+done
+logger -t zx-wifi-leds "activity trigger ${phy}tpt unavailable for $led"

@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/arm/zte.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: ZTE/Sanechips ZX279128S based boards
+
+maintainers:
+  - TBD
+
+description: |
+  Boards built around the ZTE/Sanechips ZX279128S, a dual Cortex-A9 SoC
+  (GIC, PL310 L2, A9 global timer and TWD, PL011-derived UARTs, DesignWare
+  PCIe, a hardware buffer/traffic-manager Ethernet datapath with four GE
+  ports).
+
+  Upstream removed the older ZTE ZX296702/ZX296718 platform and its board
+  binding, so Linux 6.6 has no arm/zte.yaml. Only the "zte" vendor prefix
+  remains in vendor-prefixes.yaml.
+
+  The machine code (arch/arm/mach-zx279128/platform.c) matches only
+  "zte,zx279128s". Secondary CPUs are started through the
+  "zte,zx279128s-smp" enable-method in /cpus (see arm/cpus.yaml), which also
+  needs the SMP SRAM child (sram/zte,zx279128s-smp-sram.yaml).
+
+properties:
+  $nodename:
+    const: '/'
+  compatible:
+    oneOf:
+      - description: Legacy prototype form, no longer emitted by this recipe.
+        deprecated: true
+        items:
+          - const: zte,zx279128s
+          - const: zte,zx279128
+      - description: Current ZTE ZXHN H199A Ethernet-router form.
+        items:
+          - const: zte,zxhn-h199a
+          - const: zte,zx279128s
+
+additionalProperties: true
+
+# No example. Board bindings are validated against the .dts files, and a
+# root node cannot be expressed as a dt-schema example. The real node is:
+#
+#   / {
+#       model = "ZTE ZXHN H199A";
+#       compatible = "zte,zxhn-h199a", "zte,zx279128s";
+#       ...
+#   };
+...

@@ -1,0 +1,73 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/gpio/zte,zx279128s-gpio.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: ZTE ZX279128S GPIO controller
+
+maintainers:
+  - TBD
+
+description: |
+  96 GPIO lines in six banks of 16 pins, with the banks 0x40 bytes apart. Each
+  bank has a direction register (+0x00, 1 = output), an input level
+  register (+0x14), and output set (+0x18) and output clear (+0x1c)
+  registers. GPIO n is bit (n % 16) of bank (n / 16).
+
+  The recovered driver implements no interrupt, pull or debounce support,
+  and does not expose an interrupt-controller interface. This does not
+  establish that undocumented hardware lacks those facilities. Pin muxing is done by a separate block
+  (CRM2, 0x94200000), which the bootloader programs and Linux does not
+  model. A pin that the bootloader did not mux to GPIO does not respond.
+
+  The driver (drivers/gpio/gpio-zx279128.c) maps reg[0] and hard-codes the
+  line count (96).
+
+  The PCIe driver consumes the PERST# lines (GPIO 53 and 55) through this
+  controller as the pcie nodes' reset-gpios. Only for a device tree without
+  reset-gpios does it fall back to writing these registers directly.
+
+properties:
+  compatible:
+    const: zte,zx279128s-gpio
+
+  reg:
+    maxItems: 1
+    description: Six 0x40-byte banks (0x180 bytes).
+
+  gpio-controller: true
+
+  '#gpio-cells':
+    const: 2
+
+  gpio-line-names:
+    minItems: 1
+    maxItems: 96
+
+  clocks:
+    maxItems: 1
+    description:
+      Register clock (LSP0CRPM + 0x1c bit 0, fb_gpio_pclk in the stock
+      kernel's clock tables).
+
+required:
+  - compatible
+  - reg
+  - gpio-controller
+  - '#gpio-cells'
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/clock/zte,zx279128s-crm.h>
+
+    gpio@94407000 {
+        compatible = "zte,zx279128s-gpio";
+        reg = <0x94407000 0x180>;
+        clocks = <&crm ZX_CRM_GPIO_PCLK>;
+        gpio-controller;
+        #gpio-cells = <2>;
+    };
+...

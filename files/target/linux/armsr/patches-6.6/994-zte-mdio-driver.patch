@@ -1,0 +1,42 @@
+--- a/drivers/net/mdio/Kconfig
++++ b/drivers/net/mdio/Kconfig
+@@ -207,6 +207,13 @@
+ 	  ThunderX SoCs when the MDIO bus device appears as a PCI
+ 	  device.
+ 
++config MDIO_ZX279128
++	tristate "ZTE/Sanechips ZX279128S MDIO bus"
++	depends on OF_MDIO
++	help
++	  MDIO bus controller found on ZTE/Sanechips ZX279128S SoCs
++	  (e.g. ZXHN H199A), used to reach the on-board quad GE PHYs.
++
+ comment "MDIO Multiplexers"
+ 
+ config MDIO_BUS_MUX
+--- a/drivers/net/mdio/Makefile
++++ b/drivers/net/mdio/Makefile
+@@ -20,6 +20,7 @@
+ obj-$(CONFIG_MDIO_MVUSB)		+= mdio-mvusb.o
+ obj-$(CONFIG_MDIO_OCTEON)		+= mdio-octeon.o
+ obj-$(CONFIG_MDIO_REGMAP)		+= mdio-regmap.o
++obj-$(CONFIG_MDIO_ZX279128)		+= mdio-zx279128.o
+ obj-$(CONFIG_MDIO_SUN4I)		+= mdio-sun4i.o
+ obj-$(CONFIG_MDIO_THUNDER)		+= mdio-thunder.o
+ obj-$(CONFIG_MDIO_XGENE)		+= mdio-xgene.o
+--- a/drivers/net/ethernet/Kconfig
++++ b/drivers/net/ethernet/Kconfig
+@@ -194,4 +194,6 @@
+ source "drivers/net/ethernet/xilinx/Kconfig"
+ source "drivers/net/ethernet/xircom/Kconfig"
+ 
++source "drivers/net/ethernet/zte/Kconfig"
++
+ endif # ETHERNET
+--- a/drivers/net/ethernet/Makefile
++++ b/drivers/net/ethernet/Makefile
+@@ -104,3 +104,4 @@
+ obj-$(CONFIG_NET_VENDOR_XIRCOM) += xircom/
+ obj-$(CONFIG_NET_VENDOR_SYNOPSYS) += synopsys/
+ obj-$(CONFIG_NET_VENDOR_PENSANDO) += pensando/
++obj-$(CONFIG_NET_VENDOR_ZTE) += zte/

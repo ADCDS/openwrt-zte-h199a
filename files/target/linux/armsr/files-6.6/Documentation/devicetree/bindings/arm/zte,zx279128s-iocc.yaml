@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/arm/zte,zx279128s-iocc.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: ZTE ZX279128S I/O coherency configuration
+
+maintainers:
+  - Adriel Santos <adriel@adriel.eu>
+
+description: |
+  System coherency registers initialized by the ZX279128S machine code before
+  PCI host devices are populated. PCI hosts using this configuration declare
+  dma-coherent. The configuration uses identity DMA addresses.
+
+properties:
+  compatible:
+    const: zte,zx279128s-iocc
+  reg:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false
+
+examples:
+  - |
+    coherency@a20000 {
+        compatible = "zte,zx279128s-iocc";
+        reg = <0x00a20000 0x1000>;
+    };

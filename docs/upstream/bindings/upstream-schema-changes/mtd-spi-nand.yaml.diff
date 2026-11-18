@@ -1,0 +1,29 @@
+--- a/Documentation/devicetree/bindings/mtd/spi-nand.yaml
++++ b/Documentation/devicetree/bindings/mtd/spi-nand.yaml
+@@ -17,6 +17,26 @@
+   compatible:
+     const: spi-nand
+ 
++  read-only:
++    type: boolean
++    description: |
++      Register the entire MTD device, including its master and partitions,
++      without write permission. Skip the core's automatic block-unlock step
++      during initialization and resume. Volatile configuration needed for
++      reads, such as on-die ECC selection, remains permitted.
++
++  partitioned-master-read-only:
++    type: boolean
++    description: |
++      Remove write permission from the partitioned master device after its
++      partitions have been registered. Partitions keep the permission given
++      by their own read-only property, so the master cannot be used to
++      program or erase around them.
++      TODO: the downstream implementation only honours this property when
++      CONFIG_MTD_SPI_NAND_FAIL_STOP=y. A binding must not change meaning
++      with kernel configuration; either implement it unconditionally or keep
++      it out of the binding.
++
+   reg:
+     description: Encode the chip-select line on the SPI bus
+     maxItems: 1

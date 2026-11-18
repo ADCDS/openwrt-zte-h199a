@@ -1,0 +1,229 @@
+--- a/drivers/pci/controller/dwc/pcie-zx279128.c
++++ b/drivers/pci/controller/dwc/pcie-zx279128.c
+@@ -30,6 +30,9 @@
+ #include <linux/io.h>
+ #include <linux/iopoll.h>
+ #include <linux/kernel.h>
++#include <linux/ktime.h>
++#include <linux/sched.h>
++#include <linux/spinlock.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/of.h>
+@@ -113,6 +116,16 @@
+ module_param_named(hold_perst, zx_hold_perst, bool, 0444);
+ MODULE_PARM_DESC(hold_perst, "qualification: hold both endpoints in reset through shared clock setup");
+ 
++/* Private diagnostic only: CPU write intents, never a recovery action. */
++#define ZX_TRACE_ENTRIES 32
++struct zx_cfg_write {
++	u64 seq, stamp;
++	unsigned long caller;
++	u32 reg, value, pid, devfn;
++	u16 cpu;
++	u8 size, route;
++};
++
+ struct zx_pcie {
+ 	struct dw_pcie		pci;
+ 	u32			port;		/* 0 or 1 */
+@@ -127,6 +140,14 @@
+ 	void __iomem		*gpio;
+ 	unsigned int		perst_pin;
+ 	bool			serdes_override;
++	bool trace_writes;
++	raw_spinlock_t trace_lock;
++	u64 trace_total;
++	u64 trace_route_count[2];
++	void __iomem *trace_gpio;
++	struct zx_cfg_write trace_ring[ZX_TRACE_ENTRIES];
++	struct pci_ops trace_root_ops;
++	const struct pci_ops *original_root_ops;
+ 	/* The port's line in CRM1+0x74, from the node's resets, held only
+ 	 * during the shared preparation. NULL: a device tree without resets,
+ 	 * which falls back to the direct register write.
+@@ -135,6 +156,134 @@
+ };
+ 
+ #define to_zx_pcie(x)	dev_get_drvdata((x)->dev)
++
++static bool zx_trace_offset(u32 reg, size_t size)
++{
++	u32 end;
++
++	if ((size != 1 && size != 2 && size != 4) || reg > 0x1000 - size)
++		return false;
++	end = reg + size;
++	return reg < 0x100 || (reg < 0x84 && end > 0x80) ||
++	       (reg < 0xa4 && end > 0xa0) ||
++	       (reg < 0x108 && end > 0x104) ||
++	       (reg < 0x114 && end > 0x110) ||
++	       (reg < 0x134 && end > 0x130);
++}
++
++/* No MMIO, allocation, printk or PCI lock acquisition in this logger. */
++static void zx_record_write(struct zx_pcie *zx, u8 route, unsigned int devfn,
++			    u32 reg, size_t size, u32 value, unsigned long caller)
++{
++	struct zx_cfg_write *entry;
++	unsigned long flags;
++	u64 seq;
++
++	if (!zx->trace_writes || route > 1 || !zx_trace_offset(reg, size))
++		return;
++	raw_spin_lock_irqsave(&zx->trace_lock, flags);
++	seq = ++zx->trace_total;
++	zx->trace_route_count[route]++;
++	entry = &zx->trace_ring[(seq - 1) & (ZX_TRACE_ENTRIES - 1)];
++	*entry = (struct zx_cfg_write) {
++		.seq = seq, .stamp = ktime_get_ns(), .caller = caller,
++		.reg = reg, .value = value, .pid = task_pid_nr(current),
++		.devfn = devfn, .cpu = raw_smp_processor_id(),
++		.size = size, .route = route,
++	};
++	raw_spin_unlock_irqrestore(&zx->trace_lock, flags);
++}
++
++static void zx_trace_write_dbi(struct dw_pcie *pci, void __iomem *base,
++			       u32 reg, size_t size, u32 value)
++{
++	struct zx_pcie *zx = container_of(pci, struct zx_pcie, pci);
++	int ret;
++
++	/* This hook also services iATU; never mistake another base for DBI. */
++	if (base == pci->dbi_base)
++		zx_record_write(zx, 0, 0, reg, size, value, _RET_IP_);
++	ret = dw_pcie_write(base + reg, size, value);
++	if (ret)
++		dev_err(pci->dev, "Write DBI address failed\n");
++}
++
++static int zx_trace_root_write(struct pci_bus *bus, unsigned int devfn,
++			       int where, int size, u32 value)
++{
++	struct dw_pcie_rp *pp = bus->sysdata;
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	struct zx_pcie *zx = container_of(pci, struct zx_pcie, pci);
++
++	if (pci_is_root_bus(bus) && !PCI_SLOT(devfn))
++		zx_record_write(zx, 1, devfn, where, size, value, _RET_IP_);
++	/* The PCI caller already holds pci_lock. Delegate without recursion. */
++	return zx->original_root_ops->write(bus, devfn, where, size, value);
++}
++
++static ssize_t cpu_config_writes_show(struct device *dev,
++				     struct device_attribute *attr, char *buf)
++{
++	struct zx_pcie *zx = dev_get_drvdata(dev);
++	struct zx_cfg_write *entries;
++	unsigned long flags;
++	u64 total, dbi, pci;
++	unsigned int count, i;
++	int at;
++
++	entries = kmalloc_array(ZX_TRACE_ENTRIES, sizeof(*entries), GFP_KERNEL);
++	if (!entries)
++		return -ENOMEM;
++	raw_spin_lock_irqsave(&zx->trace_lock, flags);
++	total = zx->trace_total;
++	dbi = zx->trace_route_count[0];
++	pci = zx->trace_route_count[1];
++	count = min_t(u64, total, ZX_TRACE_ENTRIES);
++	for (i = 0; i < count; i++)
++		entries[i] = zx->trace_ring[(total - 1 - i) & (ZX_TRACE_ENTRIES - 1)];
++	raw_spin_unlock_irqrestore(&zx->trace_lock, flags);
++	at = sysfs_emit(buf, "enabled=%u total=%llu dbi=%llu pci=%llu entries=%u newest-first intent-only\n",
++			zx->trace_writes, (unsigned long long)total,
++			(unsigned long long)dbi, (unsigned long long)pci, count);
++	for (i = 0; i < count && at < PAGE_SIZE - 192; i++) {
++		struct zx_cfg_write *e = &entries[i];
++
++		at += sysfs_emit_at(buf, at,
++			"seq=%llu ns=%llu route=%s cpu=%u pid=%u devfn=%02x reg=%03x size=%u val=%08x caller=%pS\n",
++			(unsigned long long)e->seq, (unsigned long long)e->stamp,
++			e->route ? "pci" : "dbi", e->cpu, e->pid, e->devfn,
++			e->reg, e->size, e->value, (void *)e->caller);
++	}
++	kfree(entries);
++	return at;
++}
++static DEVICE_ATTR_RO(cpu_config_writes);
++
++/* Private read-only comparison with the decoded VID6 board table. */
++static ssize_t board_controls_show(struct device *dev,
++				   struct device_attribute *attr, char *buf)
++{
++	struct zx_pcie *zx = dev_get_drvdata(dev);
++	u32 direction, levels;
++	unsigned int i;
++	int at;
++
++	if (!zx->trace_writes)
++		return sysfs_emit(buf, "disabled\n");
++	at = sysfs_emit(buf, "read-only VID6 controls port=%u\n", zx->port);
++	for (i = 0; i < 6; i++)
++		at += sysfs_emit_at(buf, at, "crm2_%02x=%08x\n", i * 4,
++				    readl(zx->crm2 + i * 4));
++	if (zx->trace_gpio) {
++		direction = readl(zx->trace_gpio + ZX_GPIO_BANK(52));
++		levels = readl(zx->trace_gpio + ZX_GPIO_BANK(52) + ZX_GPIO_IN);
++		for (i = 52; i <= 55; i++)
++			at += sysfs_emit_at(buf, at, "gpio%u output=%u level=%u\n", i,
++				!!(direction & BIT(i & 15)), !!(levels & BIT(i & 15)));
++	}
++	return at;
++}
++static DEVICE_ATTR_RO(board_controls);
+ 
+ /* PERST# pin state: 1 asserted (low), 0 released, negative on error. */
+ static int zx_perst_get(struct zx_pcie *zx)
+@@ -404,6 +553,7 @@
+ }
+ 
+ static const struct dw_pcie_ops zx_dw_pcie_ops = {
++	.write_dbi	= zx_trace_write_dbi,
+ 	.link_up	= zx_pcie_link_up,
+ 	.start_link	= zx_pcie_start_link,
+ 	.stop_link	= zx_pcie_stop_link,
+@@ -411,6 +561,17 @@
+ 
+ static int zx_pcie_host_init(struct dw_pcie_rp *pp)
+ {
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	struct zx_pcie *zx = container_of(pci, struct zx_pcie, pci);
++
++	if (zx->trace_writes) {
++		zx->original_root_ops = pp->bridge->ops;
++		zx->trace_root_ops = *pp->bridge->ops;
++		zx->trace_root_ops.write = zx_trace_root_write;
++		pp->bridge->ops = &zx->trace_root_ops;
++		/* child_ops pointer identity controls DWC iATU setup: keep it. */
++		dev_info(pci->dev, "private CPU config-write tracer enabled on port%u\n", zx->port);
++	}
+ 	return 0;
+ }
+ 
+@@ -466,6 +627,8 @@
+ 
+ static struct attribute *zx_pcie_attrs[] = {
+ 	&dev_attr_link_snapshot.attr,
++	&dev_attr_cpu_config_writes.attr,
++	&dev_attr_board_controls.attr,
+ 	NULL,
+ };
+ 
+@@ -781,6 +944,14 @@
+ 	if (ret < 0)
+ 		return dev_err_probe(dev, ret, "invalid PCIe port\n");
+ 	zx->port = ret;
++	raw_spin_lock_init(&zx->trace_lock);
++	zx->trace_writes = of_property_read_bool(dev->of_node, "zte,trace-config-writes");
++	if (zx->trace_writes && !zx->port) {
++		/* A separate read mapping; no GPIO request, direction or mux write. */
++		zx->trace_gpio = devm_ioremap(dev, ZX_GPIO_PHYS, SZ_4K);
++		if (!zx->trace_gpio)
++			return dev_err_probe(dev, -ENOMEM, "cannot map private GPIO observer\n");
++	}
+ 	if (legacy)
+ 		dev_warn(dev, "zte,pcie-port is deprecated; the port follows from the dbi address\n");
+ 	platform_set_drvdata(pdev, zx);

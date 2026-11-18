@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/arm/zte,zx279128s-iocc.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: ZTE ZX279128S I/O coherency configuration block
+
+maintainers:
+  - TBD
+
+description: |
+  System coherency registers that must be set up before any coherent DMA
+  master (the DesignWare PCIe hosts) is probed. PCIe hosts that depend on
+  this setup declare dma-coherent, and the PL310 node carries
+  arm,io-coherent. DMA addresses are identity mapped.
+
+  There is no driver. The machine init code (arch/arm/mach-zx279128/
+  platform.c) finds the node with of_find_compatible_node(), maps reg[0],
+  writes a fixed five-word sequence copied from the vendor kernel (offsets
+  0x00, 0x78, 0x80, 0x84 and 0x88), reads it back, and panics if the node is
+  missing, the region is smaller than 0x8c bytes, or the readback differs.
+
+  TODO: the meaning of the individual bits is unknown (the sequence is
+  replayed verbatim). Upstream will want to know what this block is, for
+  example an ACP/AXI coherency port controller, and may ask for it to be
+  handled by a driver rather than by machine code.
+
+properties:
+  compatible:
+    const: zte,zx279128s-iocc
+
+  reg:
+    maxItems: 1
+    description:
+      Coherency control registers. The machine code requires the region to
+      be at least 0x8c bytes long.
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false
+
+examples:
+  - |
+    coherency@a20000 {
+        compatible = "zte,zx279128s-iocc";
+        reg = <0x00a20000 0x1000>;
+    };
+...

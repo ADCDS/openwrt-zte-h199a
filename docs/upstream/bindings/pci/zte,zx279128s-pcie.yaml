@@ -1,0 +1,185 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/pci/zte,zx279128s-pcie.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: ZTE ZX279128S PCIe host controller
+
+maintainers:
+  - TBD
+
+description: |
+  The ZX279128S has two single-lane PCIe root complexes. Each is a Synopsys
+  DesignWare core older than 4.70a (it uses the legacy iATU viewport) with
+  a ZTE "glue" (application) register block. The blocks are at:
+
+    port 0: DBI 0x0f000000, glue 0x09500000, config 0x1c000000
+    port 1: DBI 0x0f100000, glue 0x09600000, config 0x2c000000
+
+  The glue block holds the LTSSM enable (+0x00 bit 5), the LTSSM state
+  (+0xdc bits 22:17, L0 = 0x11) and SerDes setup words (+0x1b0 and +0x1b4,
+  written for port 1 only). The vendor forces Gen1.
+
+  The two instances share clock and reset registers, the CRM blocks named
+  crm0 (TOPCRM, 0x94000000), crm1 (0x94100000) and crm2 (0x94200000). Both
+  nodes list the same three windows. The driver
+  (drivers/pci/controller/dwc/pcie-zx279128.c) prepares both ports in the
+  first probe, exactly once, because the sequence is not idempotent, and
+  uses that probe's own CRM entries. So both nodes must be present and
+  enabled. The CRM windows are mapped without being claimed, because the
+  other port and other drivers (reboot, the CRM provider) use registers in
+  the same blocks. The driver tells the two ports apart by their "dbi" address
+  (table above) and checks that "app" is the same port's glue block.
+
+  PERST# of each port is a GPIO (GPIO 53 for port 0 and GPIO 55 for port 1
+  on the H199A, both active low), given by reset-gpios. The driver drives
+  both during the shared preparation and releases them afterwards.
+
+  There is no MSI. The driver stubs msi_host_init so that the DesignWare
+  core does not look for an "msi" interrupt. INTx is routed only through
+  interrupt-map. Each port has two measured lines (port 0: SPI 63 and 59,
+  port 1: SPI 78 and 74).
+
+  The generic properties parsed by the DesignWare and PCI cores (num-lanes,
+  max-link-speed, bus-range, ranges, interrupt-map, dma-coherent) come from
+  snps,dw-pcie-common.yaml and pci-bus.yaml.
+
+  For a device tree that predates these properties, the driver falls back
+  to the fixed CRM addresses and PERST# pins above and logs that it did.
+
+  Each port's core reset (CRM1 + 0x74, port 0 bit 0, port 1 bit 3) comes
+  from "resets", a zte,zx279128s-crm reset line. Without "resets" the
+  driver writes the same bit directly, as before.
+
+  TODO: the crm0..crm2 reg entries are still an interim description, for
+  what is not a reset line:
+    - crm0: clock enables at +0x08 (port 0 bits 13-15, port 1 bits 25-27)
+      and +0x24 bit 26. They are not in the stock kernel's clock tables.
+    - crm1: configuration at +0x70, and a final blind write of 0x3f to the
+      whole of +0x74, which also covers bits 1, 2, 4 and 5 whose meaning is
+      unknown, so it cannot be expressed as reset lines.
+    - crm2: +0x0c (port 0 bit 14, port 1 bit 1), a pin-mux word.
+  Upstream would expect these as clocks (and possibly phys for the SerDes
+  words) from the CRM provider.
+  Newer kernels also accept reset-gpios in the Root Port node instead of
+  the host bridge node.
+
+# Not snps,dw-pcie.yaml: its reg-names list has no vendor name for the CRM
+# windows and allows at most five reg entries. The common DesignWare
+# properties come from snps,dw-pcie-common.yaml, as for amlogic,axg-pcie.
+allOf:
+  - $ref: /schemas/pci/pci-bus.yaml#
+  - $ref: /schemas/pci/snps,dw-pcie-common.yaml#
+
+properties:
+  compatible:
+    const: zte,zx279128s-pcie
+
+  reg:
+    items:
+      - description: DesignWare DBI registers (16 KiB)
+      - description:
+          Configuration space aperture. TODO - the vendor kernel maps 64 KiB
+          here, but the DTS gives 1 MiB.
+      - description: ZTE glue (application) registers
+      - description: CRM0 (TOPCRM) clock/reset block, shared by both ports
+      - description: CRM1 clock/reset block, shared by both ports
+      - description: CRM2 clock/reset block, shared by both ports
+
+  reg-names:
+    items:
+      - const: dbi
+      - const: config
+      - const: app
+      - const: crm0
+      - const: crm1
+      - const: crm2
+
+  reset-gpios:
+    maxItems: 1
+    description: PERST# of the slot behind this port.
+
+  zte,pcie-port:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    enum: [0, 1]
+    deprecated: true
+    description:
+      Index of this root complex. The driver derives it from the dbi
+      address; it still accepts this property, warns that it is
+      deprecated, and refuses the node if the two disagree.
+
+  dma-coherent: true
+
+  resets:
+    maxItems: 1
+    description: The port's core reset line in CRM1 + 0x74.
+
+  num-lanes:
+    const: 1
+
+  max-link-speed:
+    # TODO: Gen1 is what the vendor driver forces. Whether the PHY can run
+    # Gen2 has not been tested.
+    const: 1
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - ranges
+  - '#interrupt-cells'
+  - interrupt-map
+  - interrupt-map-mask
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+    #include <dt-bindings/reset/zte,zx279128s-crm.h>
+
+    pcie@f000000 {
+        compatible = "zte,zx279128s-pcie";
+        device_type = "pci";
+        reg = <0x0f000000 0x4000>,
+              <0x1c000000 0x100000>,
+              <0x09500000 0x1000>,
+              <0x94000000 0x1000>,
+              <0x94100000 0x1000>,
+              <0x94200000 0x1000>;
+        reg-names = "dbi", "config", "app", "crm0", "crm1", "crm2";
+        reset-gpios = <&gpio 53 GPIO_ACTIVE_LOW>;
+        resets = <&crm ZX_CRM_RST_PCIE0>;
+        dma-coherent;
+
+        bus-range = <0x00 0xff>;
+        num-lanes = <1>;
+        max-link-speed = <1>;
+        #address-cells = <3>;
+        #size-cells = <2>;
+        ranges = <0x82000000 0 0x10000000  0x10000000  0 0x08000000>;
+
+        #interrupt-cells = <1>;
+        interrupt-map-mask = <0 0 0 7>;
+        /* TODO: INTC and INTD are not known. They are aliased to the two
+         * measured lines, which is enough for single-function endpoints. */
+        interrupt-map = <0 0 0 1 &gic GIC_SPI 63 IRQ_TYPE_LEVEL_HIGH>,
+                        <0 0 0 2 &gic GIC_SPI 59 IRQ_TYPE_LEVEL_HIGH>,
+                        <0 0 0 3 &gic GIC_SPI 63 IRQ_TYPE_LEVEL_HIGH>,
+                        <0 0 0 4 &gic GIC_SPI 59 IRQ_TYPE_LEVEL_HIGH>;
+
+        /* Root port. The board DTS also has the MT7613BE endpoint here as
+         * wifi@0,0 (compatible "mediatek,mt76"). It is left out because the
+         * 6.6 pci-bus.yaml and mediatek,mt76.yaml schemas both reject it.
+         * See README.md. */
+        pcie@0,0 {
+            reg = <0x0000 0 0 0 0>;
+            #address-cells = <3>;
+            #size-cells = <2>;
+            device_type = "pci";
+            ranges;
+        };
+    };
+...

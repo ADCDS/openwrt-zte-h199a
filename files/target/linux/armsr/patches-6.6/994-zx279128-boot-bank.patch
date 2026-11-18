@@ -1,0 +1,43 @@
+--- a/arch/arm/boot/compressed/head.S
++++ b/arch/arm/boot/compressed/head.S
+@@ -326,7 +326,14 @@
+ 		addcc	r0, r0, pc
+ 		cmpcc	r4, r0
+ 		orrcc	r4, r4, #1		@ remember we skipped cache_on
++#ifdef CONFIG_ARCH_ZX279128
++		/* Vendor BootPara at 0x40007000 overlaps this page table.
++		 * Capture it in the appended DTB before the late cache_on.
++		 */
++		orr	r4, r4, #1
++#else
+ 		blcs	cache_on
++#endif
+ 
+ restart:	adr	r0, LC1
+ 		ldr	sp, [r0]
+@@ -610,6 +617,14 @@
+ 		str	r0, [r2], #4
+ 		cmp	r2, r3
+ 		blo	1b
++
++#ifdef CONFIG_ARCH_ZX279128
++		/* C relocation/BSS setup is complete, but the BootPara RAM
++		 * block has not been used for page tables yet.
++		 */
++		mov	r0, r8
++		bl	zx279128_capture_boot_bank
++#endif
+ 
+ 		/*
+ 		 * Did we skip the cache setup earlier?
+--- a/arch/arm/boot/compressed/Makefile
++++ b/arch/arm/boot/compressed/Makefile
+@@ -9,6 +9,8 @@
+ 
+ HEAD	= head.o
+ OBJS	+= misc.o decompress.o
++OBJS-$(CONFIG_ARCH_ZX279128) += zx279128-boot.o
++OBJS += $(OBJS-y)
+ ifeq ($(CONFIG_DEBUG_UNCOMPRESS),y)
+ OBJS	+= debug.o
+ AFLAGS_head.o += -DDEBUG

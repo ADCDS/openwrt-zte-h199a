@@ -1,0 +1,113 @@
+--- a/drivers/mtd/nand/spi/core.c
++++ b/drivers/mtd/nand/spi/core.c
+@@ -19,6 +19,8 @@
+ #include <linux/string.h>
+ #include <linux/spi/spi.h>
+ #include <linux/spi/spi-mem.h>
++
++#include "diagnostic.h"
+ 
+ static int spinand_read_reg_op(struct spinand_device *spinand, u8 reg, u8 *val)
+ {
+@@ -696,14 +698,19 @@
+ 	struct nand_device *nand = mtd_to_nanddev(mtd);
+ 	struct nand_io_iter iter;
+ 	bool disable_ecc = false;
++	loff_t position = to;
+ 	int ret = 0;
+ 
+ 	if (ops->mode == MTD_OPS_RAW || !mtd->ooblayout)
+ 		disable_ecc = true;
+ 
+ 	mutex_lock(&spinand->lock);
++	ret = spinand_diag_enter(spinand);
++	if (ret)
++		goto out;
+ 
+ 	nanddev_io_for_each_page(nand, NAND_PAGE_WRITE, to, ops, &iter) {
++		position = nanddev_pos_to_offs(nand, &iter.req.pos);
+ 		if (disable_ecc)
+ 			iter.req.mode = MTD_OPS_RAW;
+ 
+@@ -719,6 +726,8 @@
+ 		ops->oobretlen += iter.req.ooblen;
+ 	}
+ 
++	ret = spinand_diag_complete(spinand, position, ret, "program");
++out:
+ 	mutex_unlock(&spinand->lock);
+ 
+ 	return ret;
+@@ -790,6 +799,9 @@
+ 	struct nand_pos pos;
+ 	int ret;
+ 
++	/* Qualification must not update either physical markers or RAM BBT. */
++	if (spinand_diag_no_markbad(spinand))
++		return -EROFS;
+ 	nanddev_offs_to_pos(nand, offs, &pos);
+ 	mutex_lock(&spinand->lock);
+ 	ret = nanddev_markbad(nand, &pos);
+@@ -834,7 +846,13 @@
+ 	int ret;
+ 
+ 	mutex_lock(&spinand->lock);
+-	ret = nanddev_mtd_erase(mtd, einfo);
++	ret = spinand_diag_enter(spinand);
++	if (!ret) {
++		ret = nanddev_mtd_erase(mtd, einfo);
++		ret = spinand_diag_complete(spinand,
++			einfo->fail_addr == MTD_FAIL_ADDR_UNKNOWN ?
++			einfo->addr : einfo->fail_addr, ret, "erase");
++	}
+ 	mutex_unlock(&spinand->lock);
+ 
+ 	return ret;
+@@ -1359,6 +1377,7 @@
+ 	spi_mem_set_drvdata(mem, spinand);
+ 	spinand_set_of_node(spinand, mem->spi->dev.of_node);
+ 	mutex_init(&spinand->lock);
++	spinand_diag_init(spinand);
+ 	mtd = spinand_to_mtd(spinand);
+ 	mtd->dev.parent = &mem->spi->dev;
+ 
+@@ -1418,6 +1437,7 @@
+ 		.id_table = spinand_ids,
+ 		.driver = {
+ 			.name = "spi-nand",
++			.suppress_bind_attrs = IS_ENABLED(CONFIG_MTD_SPI_NAND_DIAGNOSTIC),
+ 			.of_match_table = of_match_ptr(spinand_of_ids),
+ 		},
+ 	},
+--- a/drivers/mtd/nand/spi/Kconfig
++++ b/drivers/mtd/nand/spi/Kconfig
+@@ -7,3 +7,14 @@
+ 	select SPI_MEM
+ 	help
+ 	  This is the framework for the SPI NAND device drivers.
++
++config MTD_SPI_NAND_DIAGNOSTIC
++	bool "SPI NAND mutation failure guard for qualification"
++	depends on MTD_SPI_NAND=y
++	default n
++	help
++	  Permit the boot-only diagnostic_write_guard option. It forbids bad
++	  block marking and stops later mutations after the first write/erase
++	  failure. Built-in support and suppressed bind attributes keep the
++	  failure latch alive until reboot. Normal operation is unchanged when
++	  the option is not selected at boot. Say N in production builds.
+--- a/include/linux/mtd/spinand.h
++++ b/include/linux/mtd/spinand.h
+@@ -433,6 +433,12 @@
+ 	struct mutex lock;
+ 	struct spinand_id id;
+ 	u32 flags;
++#ifdef CONFIG_MTD_SPI_NAND_DIAGNOSTIC
++	bool diagnostic_guard;
++	bool diagnostic_failed;
++	int diagnostic_errno;
++	loff_t diagnostic_offset;
++#endif
+ 
+ 	struct {
+ 		const struct spi_mem_op *read_cache;

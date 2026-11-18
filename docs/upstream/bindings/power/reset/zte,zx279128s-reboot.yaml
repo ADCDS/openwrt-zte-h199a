@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/reset/zte,zx279128s-reboot.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: ZTE ZX279128S system reset trigger
+
+maintainers:
+  - TBD
+
+description: |
+  A word at TOPCRM (0x94000000) offset 0x44 resets the whole system when 1
+  is written to it. The driver (drivers/power/reset/zx279128-reboot.c) maps
+  reg[0] and registers a restart handler at priority 128. The handler does an
+  unconditional writel(1), as the stock kernel does, then waits 1 s.
+
+  A generic syscon-reboot trial hung on the test board; the dedicated
+  trigger driver remains. The experiment does not rule out every generic
+  design. A future conversion must account for read-modify-write versus
+  the vendor's unconditional write and repeat hardware restart testing.
+  The CRM provider maps the containing block without claiming the trigger
+  word, which is owned by this device.
+
+properties:
+  compatible:
+    const: zte,zx279128s-reboot
+
+  reg:
+    maxItems: 1
+    description: The TOPCRM+0x44 system reset trigger word.
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false
+
+examples:
+  - |
+    /* TODO: the node name suggests a reset provider (#reset-cells), which
+     * this node is not. */
+    reset-controller@94000044 {
+        compatible = "zte,zx279128s-reboot";
+        reg = <0x94000044 0x4>;
+    };
+...

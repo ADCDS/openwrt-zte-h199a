@@ -1,0 +1,129 @@
+# SPDX-License-Identifier: GPL-2.0
+config NET_VENDOR_ZTE
+	bool "ZTE/Sanechips devices"
+	default y
+	depends on OF
+	help
+	  If you have a network (Ethernet) device belonging to this class,
+	  say Y.
+
+if NET_VENDOR_ZTE
+
+config ZX279128_ETH
+	tristate "ZTE ZX279128S Ethernet"
+	depends on OF
+	select PHYLIB
+	help
+	  Ethernet driver for the ZTE/Sanechips ZX279128S SoC (ZXHN H199A).
+	  Uses the SoC's hardware buffer manager and traffic manager rather
+	  than a conventional descriptor-ring DMA engine.
+
+config ZX279128_PCIE_PROBE_TEST
+	bool "ZX279128S PCIe bring-up validation"
+	depends on OF
+	default y
+	help
+	  Runs the reverse-engineered PCIe PHY bring-up sequence once at
+	  late_initcall, printing before and after each step so that a hang
+	  identifies the offending step exactly.
+
+	  Opt-in at runtime: it does nothing unless "zx_pcie_test" is on the
+	  kernel command line. It is a separate symbol from ZX279128_ETH
+	  because it is bring-up scaffolding rather than part of the driver,
+	  and because it uses __setup(), which only works when built in - so
+	  it must stay boolean even when the Ethernet driver is built as a
+	  module.
+
+	  Say N for a production image.
+
+config ZX279128_ETH_DEBUG
+	bool "ZX279128S Ethernet bring-up debug interfaces"
+	depends on ZX279128_ETH
+	default n
+	help
+	  Exposes bring-up instrumentation for this reverse-engineered driver:
+	  per-protocol receive counters, a descriptor identity dump, and the
+	  /proc entries zx_eth_regs (register dump), zx_eth_packets,
+	  zx_eth_poke and zx_eth_reinit (manual diagnostic datapath reset).
+	  Experimental module parameters are also available only with this option.
+
+	  These were decisive during bring-up - the register dump located the
+	  SoC's packet-parser block, and the poke interface reduced each
+	  candidate register from a six-minute build-flash-boot cycle to
+	  seconds.
+
+	  SECURITY: zx_eth_poke gives root arbitrary physical-address
+	  read/modify/write. On a router that turns any root compromise into
+	  permanent hardware manipulation, and a mistyped address can wedge the
+	  SoC or corrupt DDR. It has no place in a production image.
+
+	  Say N unless you are debugging this driver.
+
+config ZX279128_PP_TABLES
+	bool "ZX279128S packet-processor table access (experimental)"
+	depends on ZX279128_ETH
+	default n
+	help
+	  Groundwork for hardware flow offload; offloads nothing itself.
+	  Allocates the packet processor's PM (1 MiB) and ACL (4 MiB) DRAM
+	  tables, programs their base registers, and implements the CLA and
+	  PM indirect table ports. Read-only inspection is available
+	  under /sys/kernel/debug/zx279128-pp; separately gated FLOW_TEST
+	  and OFFLOAD options add experimental table mutation paths.
+
+	  The protocol is recovered from the vendor modules. Bounded register/table
+	  experiments have been run, but a working production per-flow
+	  offload path has not been demonstrated. Follow the
+	  qualification steps in docs/PP-OFFLOAD.md before enabling this in
+	  any image.
+
+	  Say N.
+
+config ZX279128_PP_FLOW_TEST
+	bool "ZX279128S packet-processor single-flow install test (experimental)"
+	depends on ZX279128_PP_TABLES
+	default n
+	help
+	  Adds a strictly gated, test-only write path on top of the packet
+	  processor table access: a root-only, write-only debugfs control file
+	  /sys/kernel/debug/zx279128-pp/flow that installs EXACTLY ONE
+	  explicitly-specified IPv4 forwarding flow into the CLA and PM DRAM
+	  tables and reads its CLA hit bit. It offloads no real traffic and has
+	  no conntrack integration.
+
+	  It writes only tables and fields that docs/PP-FLOW.md marks proven or
+	  likely and refuses (-EOPNOTSUPP) anything resting on an unknown
+	  (header rewrite, IPv6, DNAT, VLAN). A module parameter
+	  flow_test_enable must be set to 1 before any write is accepted.
+
+	  This writes into tables the live datapath engine walks. It is for
+	  bounded hardware bring-up only; follow docs/PP-OFFLOAD.md. There is
+	  no reason to enable it in any image you are not qualifying by hand.
+
+	  Say N.
+
+config ZX279128_PP_OFFLOAD
+	bool "ZX279128S packet-processor hardware flow offload (experimental)"
+	depends on ZX279128_PP_TABLES && NF_FLOW_TABLE
+	default n
+	help
+	  Experimental TC_SETUP_FT helpers intended to translate
+	  nf_flow_table (netfilter flow-table) entries into CLA
+	  exact-match and PM forwarding entries through the standard
+	  ndo_setup_tc / TC_SETUP_FT path. The current Ethernet driver does not
+	  install this hook; integration remains an unapplied patch under
+	  docs/offload/. The helper accepts only IPv4 TCP/UDP flows
+	  whose two ends are both hardware switch ports; WiFi, tunnels, IPv6,
+	  VLAN, PPPoE, fragments, NAT and multi-redirect flows stay in the
+	  software datapath.
+
+	  The "depends on NF_FLOW_TABLE" is load-bearing, not cosmetic.
+	  The release selects ZX279128_ETH built-in and nf_flow_table as a module;
+	  without this dependency - AND nf_flow_table being built
+	  in wherever this is enabled - the kernel link fails at the very end
+	  of the build (docs/upstream/SERIES.md). The depends also keeps this
+	  symbol unselectable until the table access it rests on exists.
+
+	  Not hardware-qualified. Follow docs/PP-OFFLOAD.md. Say N.
+
+endif # NET_VENDOR_ZTE

@@ -1,0 +1,54 @@
+--- a/drivers/mtd/nand/spi/core.c
++++ b/drivers/mtd/nand/spi/core.c
+@@ -1161,6 +1161,13 @@
+ 	return 0;
+ }
+ 
++/* Diagnostic whole-flash protection, including the partitioned master. */
++static bool spinand_read_only(struct spinand_device *spinand)
++{
++	return of_property_read_bool(spinand->spimem->spi->dev.of_node,
++				     "read-only");
++}
++
+ static int spinand_init_flash(struct spinand_device *spinand)
+ {
+ 	struct device *dev = &spinand->spimem->spi->dev;
+@@ -1186,6 +1193,10 @@
+ 		ret);
+ 		return ret;
+ 	}
++
++	/* Preserve hardware block protection for read-only qualification. */
++	if (spinand_read_only(spinand))
++		return 0;
+ 
+ 	/* After power up, all blocks are locked, so unlock them here. */
+ 	for (i = 0; i < nand->memorg.ntargets; i++) {
+@@ -1354,6 +1365,9 @@
+ 	ret = spinand_init(spinand);
+ 	if (ret)
+ 		return ret;
++
++	if (spinand_read_only(spinand))
++		mtd->flags &= ~MTD_WRITEABLE;
+ 
+ 	ret = mtd_device_register(mtd, NULL, 0);
+ 	if (ret)
+--- a/Documentation/devicetree/bindings/mtd/spi-nand.yaml
++++ b/Documentation/devicetree/bindings/mtd/spi-nand.yaml
+@@ -17,6 +17,14 @@
+   compatible:
+     const: spi-nand
+ 
++  read-only:
++    type: boolean
++    description: |
++      Register the entire MTD device, including its master and partitions,
++      without write permission. Skip the core's automatic block-unlock step
++      during initialization and resume. Volatile configuration needed for
++      reads, such as on-die ECC selection, remains permitted.
++
+   reg:
+     description: Encode the chip-select line on the SPI bus
+     maxItems: 1

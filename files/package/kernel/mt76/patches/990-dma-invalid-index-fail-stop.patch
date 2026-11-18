@@ -1,0 +1,1870 @@
+--- a/dma.c
++++ b/dma.c
+@@ -6,6 +6,152 @@
+ #include <linux/dma-mapping.h>
+ #include "mt76.h"
+ #include "dma.h"
++
++/* Never registered: neither PCI unbind nor wiphy_unregister may release
++ * these resources. If hardware cannot be stopped, retain them until reboot.
++ * The registry also prevents repeated probes from accumulating quarantines.
++ */
++struct mt76_dma_owner {
++	struct device resources;
++	struct device *dma_dev;
++	struct list_head list;
++	char *identity;
++};
++
++static LIST_HEAD(mt76_dma_owners);
++static DEFINE_MUTEX(mt76_dma_owners_lock);
++
++bool mt76_dma_device_busy(struct device *dev)
++{
++	struct mt76_dma_owner *entry;
++	char *identity;
++	bool busy = false;
++
++	identity = kasprintf(GFP_KERNEL, "%s:%s",
++		dev->bus ? dev->bus->name : "platform", dev_name(dev));
++	if (!identity)
++		return true;
++	mutex_lock(&mt76_dma_owners_lock);
++	list_for_each_entry(entry, &mt76_dma_owners, list) {
++		if (!strcmp(entry->identity, identity)) {
++			busy = true;
++			break;
++		}
++	}
++	mutex_unlock(&mt76_dma_owners_lock);
++	kfree(identity);
++	return busy;
++}
++EXPORT_SYMBOL_GPL(mt76_dma_device_busy);
++
++static void mt76_dma_owner_release(struct device *resources)
++{
++	struct mt76_dma_owner *owner = container_of(resources,
++					struct mt76_dma_owner, resources);
++
++	mutex_lock(&mt76_dma_owners_lock);
++	list_del(&owner->list);
++	mutex_unlock(&mt76_dma_owners_lock);
++	put_device(owner->dma_dev);
++	kfree(owner->identity);
++	kfree(owner);
++	module_put(THIS_MODULE);
++}
++
++int mt76_dma_owner_init(struct mt76_dev *dev)
++{
++	struct mt76_dma_owner *owner, *entry;
++	int ret = 0;
++
++	owner = kzalloc(sizeof(*owner), GFP_KERNEL);
++	if (!owner)
++		return -ENOMEM;
++	owner->identity = kasprintf(GFP_KERNEL, "%s:%s",
++		dev->dev->bus ? dev->dev->bus->name : "platform",
++		dev_name(dev->dev));
++	if (!owner->identity) {
++		kfree(owner);
++		return -ENOMEM;
++	}
++	mutex_lock(&mt76_dma_owners_lock);
++	list_for_each_entry(entry, &mt76_dma_owners, list) {
++		if (!strcmp(entry->identity, owner->identity)) {
++			ret = -EBUSY;
++			goto failed;
++		}
++	}
++	if (!try_module_get(THIS_MODULE)) {
++		ret = -ENODEV;
++		goto failed;
++	}
++	device_initialize(&owner->resources);
++	owner->resources.release = mt76_dma_owner_release;
++	owner->dma_dev = get_device(dev->dma_dev);
++	list_add(&owner->list, &mt76_dma_owners);
++	dev->dma_resources = &owner->resources;
++	mutex_unlock(&mt76_dma_owners_lock);
++	return 0;
++failed:
++	mutex_unlock(&mt76_dma_owners_lock);
++	kfree(owner->identity);
++	kfree(owner);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mt76_dma_owner_init);
++
++void mt76_dma_owner_put(struct mt76_dev *dev)
++{
++	if (dev->dma_resources && !dev->dma_quarantined) {
++		put_device(dev->dma_resources);
++		dev->dma_resources = NULL;
++	}
++}
++EXPORT_SYMBOL_GPL(mt76_dma_owner_put);
++
++struct mt76_dma_allocation {
++	struct device *dma_dev;
++	void *address;
++	dma_addr_t dma;
++	size_t bytes;
++};
++
++static void mt76_dma_free_allocation(void *data)
++{
++	struct mt76_dma_allocation *allocation = data;
++
++	dma_free_coherent(allocation->dma_dev, allocation->bytes,
++			  allocation->address, allocation->dma);
++	kfree(allocation);
++}
++
++static void *mt76_dma_alloc_desc(struct mt76_dev *dev, size_t bytes,
++				dma_addr_t *dma)
++{
++	struct mt76_dma_allocation *allocation;
++
++	if (!dev->dma_resources)
++		return dmam_alloc_coherent(dev->dma_dev, bytes, dma, GFP_KERNEL);
++	allocation = kzalloc(sizeof(*allocation), GFP_KERNEL);
++	if (!allocation)
++		return NULL;
++	allocation->address = dma_alloc_coherent(dev->dma_dev, bytes, dma, GFP_KERNEL);
++	if (!allocation->address) {
++		kfree(allocation);
++		return NULL;
++	}
++	allocation->dma_dev = dev->dma_dev;
++	allocation->bytes = bytes;
++	allocation->dma = *dma;
++	if (devm_add_action_or_reset(dev->dma_resources,
++				     mt76_dma_free_allocation, allocation))
++		return NULL;
++	return allocation->address;
++}
++
++static void mt76_dma_destroy_pool(void *pool)
++{
++	page_pool_destroy(pool);
++}
+ 
+ static struct mt76_txwi_cache *
+ mt76_alloc_txwi(struct mt76_dev *dev)
+@@ -185,9 +331,33 @@
+ 	}
+ }
+ 
+-static void
++static bool
++mt76_dma_index_valid(struct mt76_dev *dev, struct mt76_queue *q, u32 index)
++{
++	if (mt76_dma_failed(dev) && !dev->dma_cleanup_only)
++		return false;
++	if (q->ndesc > 0 && index < (u32)q->ndesc)
++		return true;
++	if (mt76_dma_set_failed(dev))
++		dev_err(dev->dev, "invalid DMA index %#x for %d entries (head=%u tail=%u); queue operations blocked\n",
++			index, q->ndesc, q->head, q->tail);
++	return false;
++}
++
++static bool
++mt76_dma_cursors_valid(struct mt76_dev *dev, struct mt76_queue *q)
++{
++	return mt76_dma_index_valid(dev, q, q->head) &&
++	       mt76_dma_index_valid(dev, q, q->tail);
++}
++
++static bool
+ mt76_dma_sync_idx(struct mt76_dev *dev, struct mt76_queue *q)
+ {
++	u32 index;
++
++	if (mt76_dma_failed(dev) || dev->dma_cleanup_only)
++		return false;
+ 	Q_WRITE(q, desc_base, q->desc_dma);
+ 	if ((q->flags & MT_QFLAG_WED_RRO_EN) && !mt76_npu_device_active(dev))
+ 		Q_WRITE(q, ring_size, MT_DMA_RRO_EN | q->ndesc);
+@@ -198,14 +368,20 @@
+ 		writel(q->desc_dma, &q->regs->desc_base);
+ 		writel(q->ndesc, &q->regs->ring_size);
+ 	}
+-	q->head = Q_READ(q, dma_idx);
+-	q->tail = q->head;
++	index = Q_READ(q, dma_idx);
++	if (!mt76_dma_index_valid(dev, q, index))
++		return false;
++	q->head = index;
++	q->tail = index;
++	return true;
+ }
+ 
+ void mt76_dma_queue_reset(struct mt76_dev *dev, struct mt76_queue *q,
+ 			  bool reset_idx)
+ {
+-	if (!q || !q->ndesc)
++	if (!q || !q->ndesc || mt76_dma_failed(dev))
++		return;
++	if (!mt76_dma_cursors_valid(dev, q))
+ 		return;
+ 
+ 	if (!mt76_queue_is_wed_rro_ind(q) &&
+@@ -232,12 +408,16 @@
+ mt76_dma_add_rx_buf(struct mt76_dev *dev, struct mt76_queue *q,
+ 		    struct mt76_queue_buf *buf, void *data)
+ {
+-	struct mt76_queue_entry *entry = &q->entry[q->head];
++	struct mt76_queue_entry *entry;
+ 	struct mt76_txwi_cache *txwi = NULL;
+ 	u32 buf1 = 0, ctrl, info = 0;
+ 	struct mt76_desc *desc;
+ 	int idx = q->head;
+ 	int rx_token;
++
++	if (!mt76_dma_cursors_valid(dev, q))
++		return -EIO;
++	entry = &q->entry[q->head];
+ 
+ 	if (mt76_queue_is_wed_rro_ind(q)) {
+ 		struct mt76_wed_rro_desc *rro_desc;
+@@ -396,6 +576,8 @@
+ static void
+ mt76_dma_kick_queue(struct mt76_dev *dev, struct mt76_queue *q)
+ {
++	if (dev->dma_cleanup_only || !mt76_dma_cursors_valid(dev, q))
++		return;
+ 	wmb();
+ 	if (mt76_queue_is_emi(q))
+ 		*q->emi_cpu_idx = cpu_to_le16(q->head);
+@@ -407,18 +589,21 @@
+ mt76_dma_tx_cleanup(struct mt76_dev *dev, struct mt76_queue *q, bool flush)
+ {
+ 	struct mt76_queue_entry entry;
+-	int last;
++	u32 last = 0;
+ 
+ 	if (!q || !q->ndesc)
+ 		return;
+ 
+ 	spin_lock_bh(&q->cleanup_lock);
+-	if (flush)
+-		last = -1;
+-	else
++	if (!mt76_dma_cursors_valid(dev, q))
++		goto unlock;
++	if (!flush) {
+ 		last = Q_READ(q, dma_idx);
+-
+-	while (q->queued > 0 && q->tail != last) {
++		if (!mt76_dma_index_valid(dev, q, last))
++			goto unlock;
++	}
++
++	while (q->queued > 0 && (flush || q->tail != last)) {
+ 		mt76_dma_tx_cleanup_idx(dev, q, q->tail, &entry);
+ 		mt76_npu_txdesc_cleanup(q, q->tail);
+ 		mt76_queue_tx_complete(dev, q, &entry);
+@@ -428,15 +613,19 @@
+ 				mt76_put_txwi(dev, entry.txwi);
+ 		}
+ 
+-		if (!flush && q->tail == last)
++		if (!flush && q->tail == last) {
+ 			last = Q_READ(q, dma_idx);
+-	}
++			if (!mt76_dma_index_valid(dev, q, last))
++				goto unlock;
++		}
++	}
++unlock:
+ 	spin_unlock_bh(&q->cleanup_lock);
+ 
+-	if (flush) {
++	if (flush && !dev->dma_cleanup_only) {
+ 		spin_lock_bh(&q->lock);
+-		mt76_dma_sync_idx(dev, q);
+-		mt76_dma_kick_queue(dev, q);
++		if (mt76_dma_sync_idx(dev, q))
++			mt76_dma_kick_queue(dev, q);
+ 		spin_unlock_bh(&q->lock);
+ 	}
+ 
+@@ -553,6 +742,8 @@
+ 	*more = false;
+ 	if (!q->queued)
+ 		return NULL;
++	if (!mt76_dma_cursors_valid(dev, q))
++		return NULL;
+ 
+ 	if (mt76_queue_is_wed_rro_data(q) || mt76_queue_is_wed_rro_msdu_pg(q))
+ 		goto done;
+@@ -622,6 +813,11 @@
+ 	buf.len = skb->len;
+ 
+ 	spin_lock_bh(&q->lock);
++	if (!mt76_dma_cursors_valid(dev, q)) {
++		spin_unlock_bh(&q->lock);
++		dma_unmap_single(dev->dma_dev, addr, skb->len, DMA_TO_DEVICE);
++		goto error;
++	}
+ 	mt76_dma_add_buf(dev, q, &buf, 1, tx_info, skb, NULL);
+ 	mt76_dma_kick_queue(dev, q);
+ 	spin_unlock_bh(&q->lock);
+@@ -652,6 +848,13 @@
+ 	dma_addr_t addr;
+ 	u8 *txwi;
+ 
++	/* Caller holds q->lock. Check before tx_prepare_skb transfers token/skb
++	 * ownership; a late add_buf rejection would require token rollback.
++	 */
++	if (!mt76_dma_cursors_valid(dev, q)) {
++		ret = -EIO;
++		goto free_skb;
++	}
+ 	if (test_bit(MT76_RESET, &phy->state))
+ 		goto free_skb;
+ 
+@@ -748,6 +951,8 @@
+ 	int frames = 0;
+ 
+ 	if (!q->ndesc)
++		return 0;
++	if (!mt76_dma_cursors_valid(dev, q))
+ 		return 0;
+ 
+ 	while (q->queued < q->ndesc - 1) {
+@@ -818,20 +1023,27 @@
+ 	else
+ 		size = sizeof(struct mt76_desc);
+ 
+-	q->desc = dmam_alloc_coherent(dev->dma_dev, q->ndesc * size,
+-				      &q->desc_dma, GFP_KERNEL);
++	q->desc = mt76_dma_alloc_desc(dev, q->ndesc * size, &q->desc_dma);
+ 	if (!q->desc)
+ 		return -ENOMEM;
+ 
+ 	mt76_dma_queue_magic_cnt_init(dev, q);
+ 	size = q->ndesc * sizeof(*q->entry);
+-	q->entry = devm_kzalloc(dev->dev, size, GFP_KERNEL);
++	q->entry = devm_kzalloc(mt76_dma_resource_dev(dev), size, GFP_KERNEL);
+ 	if (!q->entry)
+ 		return -ENOMEM;
+ 
+ 	ret = mt76_create_page_pool(dev, q);
+ 	if (ret)
+ 		return ret;
++	if (dev->dma_resources) {
++		ret = devm_add_action_or_reset(dev->dma_resources,
++					       mt76_dma_destroy_pool, q->page_pool);
++		if (ret) {
++			q->page_pool = NULL;
++			return ret;
++		}
++	}
+ 
+ 	mt76_npu_queue_setup(dev, q);
+ 	ret = mt76_wed_dma_setup(dev, q, false);
+@@ -849,7 +1061,7 @@
+ 	 */
+ 	mt76_dma_queue_reset(dev, q, !mt76_queue_is_emi(q));
+ 
+-	return 0;
++	return mt76_dma_failed(dev) ? -EIO : 0;
+ }
+ 
+ static void
+@@ -894,6 +1106,8 @@
+ 
+ 	if (!q->ndesc)
+ 		return;
++	if (!mt76_dma_cursors_valid(dev, q))
++		return;
+ 
+ 	if (!mt76_queue_is_wed_rro_ind(q) &&
+ 	    !mt76_queue_is_wed_rro_rxdmad_c(q) && !mt76_queue_is_npu(q)) {
+@@ -906,7 +1120,12 @@
+ 	mt76_dma_rx_cleanup(dev, q);
+ 
+ 	/* reset WED rx queues */
+-	mt76_wed_dma_setup(dev, q, true);
++	if (mt76_wed_dma_setup(dev, q, true)) {
++		mt76_dma_set_failed(dev);
++		return;
++	}
++	if (mt76_dma_failed(dev))
++		return;
+ 
+ 	if (mt76_queue_is_wed_tx_free(q))
+ 		return;
+@@ -915,7 +1134,8 @@
+ 	    mt76_queue_is_wed_rro(q))
+ 		return;
+ 
+-	mt76_dma_sync_idx(dev, q);
++	if (!mt76_dma_sync_idx(dev, q))
++		return;
+ 	if (mt76_queue_is_npu(q))
+ 		mt76_npu_fill_rx_queue(dev, q);
+ 	else
+@@ -952,17 +1172,22 @@
+ static int
+ mt76_dma_rx_process(struct mt76_dev *dev, struct mt76_queue *q, int budget)
+ {
+-	int len, data_len, done = 0, dma_idx;
++	int len, data_len, done = 0;
++	u32 dma_idx;
+ 	struct sk_buff *skb;
+ 	unsigned char *data;
+ 	bool check_ddone = false;
+ 	bool allow_direct = !mt76_queue_is_wed_rx(q);
+ 	bool more;
+ 
++	if (!mt76_dma_cursors_valid(dev, q))
++		return 0;
+ 	if ((q->flags & MT_QFLAG_WED_RRO_EN) ||
+ 	    (IS_ENABLED(CONFIG_NET_MEDIATEK_SOC_WED) &&
+ 	     mt76_queue_is_wed_tx_free(q))) {
+ 		dma_idx = Q_READ(q, dma_idx);
++		if (!mt76_dma_index_valid(dev, q, dma_idx))
++			return 0;
+ 		check_ddone = true;
+ 	}
+ 
+@@ -971,8 +1196,11 @@
+ 		u32 info;
+ 
+ 		if (check_ddone) {
+-			if (q->tail == dma_idx)
++			if (q->tail == dma_idx) {
+ 				dma_idx = Q_READ(q, dma_idx);
++				if (!mt76_dma_index_valid(dev, q, dma_idx))
++					break;
++			}
+ 
+ 			if (q->tail == dma_idx)
+ 				break;
+@@ -1103,6 +1331,7 @@
+ 	dev->tx_napi_dev = alloc_netdev_dummy(sizeof(struct mt76_dev *));
+ 	if (!dev->tx_napi_dev) {
+ 		free_netdev(dev->napi_dev);
++		dev->napi_dev = NULL;
+ 		return -ENOMEM;
+ 	}
+ 	priv = netdev_priv(dev->tx_napi_dev);
+@@ -1143,13 +1372,90 @@
+ }
+ EXPORT_SYMBOL_GPL(mt76_dma_attach);
+ 
++void mt76_dma_stop_napi(struct mt76_dev *dev)
++{
++	int i;
++
++	if (dev->dma_napi_stopped)
++		return;
++	mt76_worker_disable(&dev->tx_worker);
++	if (dev->tx_napi.dev) {
++		if (!dev->dma_napi_disabled)
++			napi_disable(&dev->tx_napi);
++		netif_napi_del(&dev->tx_napi);
++	}
++	for (i = 0; i < ARRAY_SIZE(dev->napi); i++) {
++		if (!dev->napi[i].dev)
++			continue;
++		if (!dev->dma_napi_disabled)
++			napi_disable(&dev->napi[i]);
++		netif_napi_del(&dev->napi[i]);
++	}
++	dev->dma_napi_stopped = true;
++	dev->dma_napi_disabled = true;
++}
++EXPORT_SYMBOL_GPL(mt76_dma_stop_napi);
++
++void mt76_dma_quarantine(struct mt76_dev *dev)
++{
++	mt76_dma_stop_napi(dev);
++	if (!dev->dma_quarantined)
++		dev_err(dev->dev, "DMA memory quarantined until reboot; reprobe denied\n");
++	dev->dma_quarantined = true;
++}
++EXPORT_SYMBOL_GPL(mt76_dma_quarantine);
++
++static bool mt76_dma_queue_cleanup_valid(struct mt76_queue *q)
++{
++	if (!q)
++		return true;
++	if (!q->entry)
++		return !q->queued;
++	return q->ndesc > 0 && q->head < q->ndesc &&
++	       q->tail < q->ndesc && q->queued >= 0 && q->queued <= q->ndesc;
++}
++
++static bool mt76_dma_cleanup_valid(struct mt76_dev *dev)
++{
++	int i, j;
++
++	for (i = 0; i < ARRAY_SIZE(dev->phys); i++) {
++		if (!dev->phys[i])
++			continue;
++		for (j = 0; j < ARRAY_SIZE(dev->phys[i]->q_tx); j++)
++			if (!mt76_dma_queue_cleanup_valid(dev->phys[i]->q_tx[j]))
++				return false;
++	}
++	for (i = 0; i < ARRAY_SIZE(dev->q_mcu); i++)
++		if (!mt76_dma_queue_cleanup_valid(dev->q_mcu[i]))
++			return false;
++	for (i = 0; i < ARRAY_SIZE(dev->q_rx); i++)
++		if (!mt76_dma_queue_cleanup_valid(&dev->q_rx[i]))
++			return false;
++	return true;
++}
++
+ void mt76_dma_cleanup(struct mt76_dev *dev)
+ {
+ 	int i;
+ 
+-	mt76_worker_disable(&dev->tx_worker);
+-	napi_disable(&dev->tx_napi);
+-	netif_napi_del(&dev->tx_napi);
++	if (dev->dma_resources) {
++		if (!dev->dma_quiesced || !mt76_dma_cleanup_valid(dev)) {
++			mt76_dma_quarantine(dev);
++			return;
++		}
++		mt76_dma_stop_napi(dev);
++	} else {
++		mt76_worker_disable(&dev->tx_worker);
++		napi_disable(&dev->tx_napi);
++		netif_napi_del(&dev->tx_napi);
++	}
++	/* Final cleanup must still retire known ownership after a fault.
++	 * Drivers without a private owner retain their existing hardware-stop
++	 * prerequisite; this does not give them quarantine or stop proof.
++	 * Preserve their ordinary healthy cleanup behavior.
++	 */
++	dev->dma_cleanup_only = dev->dma_resources || mt76_dma_failed(dev);
+ 
+ 	for (i = 0; i < ARRAY_SIZE(dev->phys); i++) {
+ 		struct mt76_phy *phy = dev->phys[i];
+@@ -1172,10 +1478,14 @@
+ 		    mt76_queue_is_wed_rro(q))
+ 			continue;
+ 
+-		netif_napi_del(&dev->napi[i]);
++		if (!dev->dma_resources)
++			netif_napi_del(&dev->napi[i]);
++		if (!q->entry)
++			continue;
+ 		mt76_dma_rx_cleanup(dev, q);
+ 
+-		page_pool_destroy(q->page_pool);
++		if (!dev->dma_resources)
++			page_pool_destroy(q->page_pool);
+ 	}
+ 
+ 	if (mtk_wed_device_active(&dev->mmio.wed))
+@@ -1186,7 +1496,10 @@
+ 
+ 	mt76_free_pending_txwi(dev);
+ 	mt76_free_pending_rxwi(dev);
+-	free_netdev(dev->napi_dev);
+-	free_netdev(dev->tx_napi_dev);
++	if (dev->napi_dev)
++		free_netdev(dev->napi_dev);
++	if (dev->tx_napi_dev)
++		free_netdev(dev->tx_napi_dev);
++	dev->napi_dev = dev->tx_napi_dev = NULL;
+ }
+ EXPORT_SYMBOL_GPL(mt76_dma_cleanup);
+--- a/dma.h
++++ b/dma.h
+@@ -74,15 +74,15 @@
+ 
+ #define Q_READ(_q, _field) ({						\
+ 	u32 _offset = offsetof(struct mt76_queue_regs, _field);		\
+-	u32 _val;							\
++	u32 _val = U32_MAX;							\
+ 	if ((_q)->flags & MT_QFLAG_NPU) {				\
+ 		struct airoha_npu *npu;					\
+ 									\
+ 		rcu_read_lock();					\
+ 		npu = rcu_dereference(q->dev->mmio.npu);		\
+-		if (npu)						\
+-			regmap_read(npu->regmap,			\
+-				    ((_q)->wed_regs + _offset), &_val);	\
++		if (npu && regmap_read(npu->regmap,		\
++				       ((_q)->wed_regs + _offset), &_val)) \
++			_val = U32_MAX;				\
+ 		rcu_read_unlock();					\
+ 	} else {							\
+ 		_val = readl(&(_q)->regs->_field);			\
+@@ -175,8 +175,11 @@
+ mt76_dma_reset_tx_queue(struct mt76_dev *dev, struct mt76_queue *q)
+ {
+ 	dev->queue_ops->reset_q(dev, q, true);
+-	if (mtk_wed_device_active(&dev->mmio.wed))
+-		mt76_wed_dma_setup(dev, q, true);
++	if (mt76_dma_failed(dev))
++		return;
++	if (mtk_wed_device_active(&dev->mmio.wed) &&
++	    mt76_wed_dma_setup(dev, q, true))
++		mt76_dma_set_failed(dev);
+ }
+ 
+ static inline void
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -607,6 +607,7 @@
+ 		mt76_led_cleanup(phy);
+ 	mt76_tx_status_check(dev, true);
+ 	ieee80211_unregister_hw(phy->hw);
++	clear_bit(MT76_STATE_REGISTERED, &phy->state);
+ 	dev->phys[phy->band_idx] = NULL;
+ }
+ EXPORT_SYMBOL_GPL(mt76_unregister_phy);
+@@ -798,6 +799,7 @@
+ 	mt76_tx_status_check(dev, true);
+ 	mt76_wcid_cleanup(dev, &dev->global_wcid);
+ 	ieee80211_unregister_hw(hw);
++	clear_bit(MT76_STATE_REGISTERED, &dev->phy.state);
+ }
+ EXPORT_SYMBOL_GPL(mt76_unregister_device);
+ 
+@@ -809,6 +811,9 @@
+ 		dev->wq = NULL;
+ 	}
+ 	mt76_npu_deinit(dev);
++	if (dev->dma_quarantined)
++		return;
++	mt76_dma_owner_put(dev);
+ 	ieee80211_free_hw(dev->hw);
+ }
+ EXPORT_SYMBOL_GPL(mt76_free_device);
+@@ -1961,7 +1966,7 @@
+ 	struct mt76_queue *hwq;
+ 	int err;
+ 
+-	hwq = devm_kzalloc(dev->dev, sizeof(*hwq), GFP_KERNEL);
++	hwq = devm_kzalloc(mt76_dma_resource_dev(dev), sizeof(*hwq), GFP_KERNEL);
+ 	if (!hwq)
+ 		return ERR_PTR(-ENOMEM);
+ 
+--- a/mcu.c
++++ b/mcu.c
+@@ -58,6 +58,9 @@
+ {
+ 	struct sk_buff *skb;
+ 
++	if (mt76_dma_failed(dev))
++		return -EIO;
++
+ 	if (dev->mcu_ops->mcu_send_msg)
+ 		return dev->mcu_ops->mcu_send_msg(dev, cmd, data, len, wait_resp);
+ 
+@@ -84,8 +87,17 @@
+ 
+ 	if (ret_skb)
+ 		*ret_skb = NULL;
++	if (mt76_dma_failed(dev)) {
++		dev_kfree_skb(skb);
++		return -EIO;
++	}
+ 
+ 	mutex_lock(&dev->mcu.mutex);
++	if (mt76_dma_failed(dev)) {
++		dev_kfree_skb(skb);
++		ret = -EIO;
++		goto out;
++	}
+ 
+ 	if (dev->mcu_ops->mcu_skb_prepare_msg) {
+ 		orig_skb = skb;
+--- a/mt76.h
++++ b/mt76.h
+@@ -525,6 +525,7 @@
+ 	MT76_STATE_ROC,
+ 	MT76_STATE_PM,
+ 	MT76_STATE_WED_RESET,
++	MT76_DMA_ERROR,
+ };
+ 
+ enum mt76_sta_event {
+@@ -575,6 +576,8 @@
+ 		       struct sk_buff *skb, u32 *info);
+ 
+ 	void (*rx_poll_complete)(struct mt76_dev *dev, enum mt76_rxq_id q);
++	/* Atomic context; called once when DMA register/queue validation fails. */
++	void (*dma_error)(struct mt76_dev *dev);
+ 
+ 	void (*rx_rro_ind_process)(struct mt76_dev *dev, void *data);
+ 	int (*rx_rro_add_msdu_page)(struct mt76_dev *dev, struct mt76_queue *q,
+@@ -946,6 +949,13 @@
+ 	const struct mt76_mcu_ops *mcu_ops;
+ 	struct device *dev;
+ 	struct device *dma_dev;
++	/* Optional private lifetime for DMA memory on an inaccessible device. */
++	struct device *dma_resources;
++	bool dma_quiesced;
++	bool dma_cleanup_only;
++	bool dma_quarantined;
++	bool dma_napi_stopped;
++	bool dma_napi_disabled;
+ 
+ 	struct mt76_mcu mcu;
+ 
+@@ -1227,6 +1237,34 @@
+ void mt76_mmio_init(struct mt76_dev *dev, void __iomem *regs);
+ void mt76_pci_disable_aspm(struct pci_dev *pdev);
+ bool mt76_pci_aspm_supported(struct pci_dev *pdev);
++
++/* A failed DMA register read is fatal until a complete device reprobe.
++ * Ordinary flow control and firmware reset must not clear this latch.
++ */
++static inline bool mt76_dma_failed(struct mt76_dev *dev)
++{
++	return test_bit(MT76_DMA_ERROR, &dev->phy.state);
++}
++
++static inline bool mt76_dma_set_failed(struct mt76_dev *dev)
++{
++	if (test_and_set_bit(MT76_DMA_ERROR, &dev->phy.state))
++		return false;
++	if (dev->drv->dma_error)
++		dev->drv->dma_error(dev);
++	return true;
++}
++
++static inline struct device *mt76_dma_resource_dev(struct mt76_dev *dev)
++{
++	return dev->dma_resources ?: dev->dev;
++}
++
++int mt76_dma_owner_init(struct mt76_dev *dev);
++bool mt76_dma_device_busy(struct device *dev);
++void mt76_dma_owner_put(struct mt76_dev *dev);
++void mt76_dma_quarantine(struct mt76_dev *dev);
++void mt76_dma_stop_napi(struct mt76_dev *dev);
+ 
+ static inline u16 mt76_chip(struct mt76_dev *dev)
+ {
+--- a/mt7615/dma.c
++++ b/mt7615/dma.c
+@@ -68,6 +68,10 @@
+ 	struct mt7615_dev *dev;
+ 
+ 	dev = mt76_priv(napi->dev);
++	if (mt76_dma_failed(&dev->mt76)) {
++		napi_complete(napi);
++		return 0;
++	}
+ 	if (!mt76_connac_pm_ref(&dev->mphy, &dev->pm)) {
+ 		napi_complete(napi);
+ 		queue_work(dev->mt76.wq, &dev->pm.wake_work);
+@@ -90,6 +94,10 @@
+ 	int done;
+ 
+ 	dev = mt76_priv(napi->dev);
++	if (mt76_dma_failed(&dev->mt76)) {
++		napi_complete(napi);
++		return 0;
++	}
+ 
+ 	if (!mt76_connac_pm_ref(&dev->mphy, &dev->pm)) {
+ 		napi_complete(napi);
+@@ -200,9 +208,18 @@
+ 
+ void mt7615_dma_start(struct mt7615_dev *dev)
+ {
++	u32 value;
++
++	if (mt76_dma_failed(&dev->mt76))
++		return;
++	value = mt76_rr(dev, MT_WPDMA_GLO_CFG);
++	if (value == U32_MAX) {
++		mt7615_dma_fail(dev, "invalid DMA start status", value);
++		return;
++	}
+ 	/* start dma engine */
+-	mt76_set(dev, MT_WPDMA_GLO_CFG,
+-		 MT_WPDMA_GLO_CFG_TX_DMA_EN |
++	dev->mt76.dma_quiesced = false;
++	mt76_wr(dev, MT_WPDMA_GLO_CFG, value | MT_WPDMA_GLO_CFG_TX_DMA_EN |
+ 		 MT_WPDMA_GLO_CFG_RX_DMA_EN |
+ 		 MT_WPDMA_GLO_CFG_TX_WRITEBACK_DONE);
+ 
+@@ -302,15 +319,13 @@
+ 
+ 	mt7615_dma_start(dev);
+ 
+-	return 0;
++	return mt76_dma_failed(&dev->mt76) ? -EIO : 0;
+ }
+ 
+ void mt7615_dma_cleanup(struct mt7615_dev *dev)
+ {
+-	mt76_clear(dev, MT_WPDMA_GLO_CFG,
+-		   MT_WPDMA_GLO_CFG_TX_DMA_EN |
+-		   MT_WPDMA_GLO_CFG_RX_DMA_EN);
+-	mt76_set(dev, MT_WPDMA_GLO_CFG, MT_WPDMA_GLO_CFG_SW_RESET);
+-
++	/* Caller has stopped IRQ/NAPI and positively verified engine stop.
++	 * Generic cleanup now retires buffers without touching registers.
++	 */
+ 	mt76_dma_cleanup(&dev->mt76);
+ }
+--- a/mt7615/init.c
++++ b/mt7615/init.c
+@@ -221,6 +221,8 @@
+ 
+ bool mt7615_wait_for_mcu_init(struct mt7615_dev *dev)
+ {
++	if (mt76_dma_failed(&dev->mt76))
++		return false;
+ 	flush_work(&dev->mcu_work);
+ 
+ 	return test_bit(MT76_STATE_MCU_RUNNING, &dev->mphy.state);
+@@ -474,6 +476,8 @@
+ 
+ 	mphy = container_of(led_cdev, struct mt76_phy, leds.cdev);
+ 	dev = container_of(mphy->dev, struct mt7615_dev, mt76);
++	if (mt76_dma_failed(&dev->mt76))
++		return;
+ 
+ 	if (!mt76_connac_pm_ref(mphy, &dev->pm))
+ 		return;
+@@ -607,7 +611,8 @@
+ 
+ 	mt7615_cap_dbdc_disable(dev);
+ 	mt76_unregister_phy(mphy);
+-	ieee80211_free_hw(mphy->hw);
++	if (!dev->mt76.dma_quarantined)
++		ieee80211_free_hw(mphy->hw);
+ }
+ EXPORT_SYMBOL_GPL(mt7615_unregister_ext_phy);
+ 
+--- a/mt7615/mac.c
++++ b/mt7615/mac.c
+@@ -2014,6 +2014,10 @@
+ 	dev = (struct mt7615_dev *)container_of(work, struct mt7615_dev,
+ 						pm.wake_work);
+ 	mphy = dev->phy.mt76;
++	if (mt76_dma_failed(&dev->mt76)) {
++		wake_up(&dev->pm.wait);
++		return;
++	}
+ 
+ 	if (!mt7615_mcu_set_drv_ctrl(dev)) {
+ 		struct mt76_dev *mdev = &dev->mt76;
+@@ -2052,6 +2056,8 @@
+ 
+ 	dev = (struct mt7615_dev *)container_of(work, struct mt7615_dev,
+ 						pm.ps_work.work);
++	if (mt76_dma_failed(&dev->mt76))
++		return;
+ 
+ 	delta = dev->pm.idle_timeout;
+ 	if (test_bit(MT76_HW_SCANNING, &dev->mphy.state) ||
+@@ -2087,6 +2093,8 @@
+ 					       mac_work.work);
+ 	phy = mphy->priv;
+ 
++	if (mt76_dma_failed(mphy->dev))
++		return;
+ 	mt7615_mutex_acquire(phy->dev);
+ 
+ 	mt7615_update_survey(phy->dev);
+--- a/mt7615/main.c
++++ b/mt7615/main.c
+@@ -32,6 +32,9 @@
+ 	bool running;
+ 	int ret;
+ 
++	if (mt76_dma_failed(&dev->mt76))
++		return -EIO;
++
+ 	if (!mt7615_wait_for_mcu_init(dev))
+ 		return -EIO;
+ 
+@@ -104,6 +107,11 @@
+ 	cancel_work_sync(&dev->pm.wake_work);
+ 
+ 	mt76_connac_free_pending_tx_skbs(&dev->pm, NULL);
++	if (mt76_dma_failed(&dev->mt76)) {
++		clear_bit(MT76_STATE_RUNNING, &phy->mt76->state);
++		cancel_delayed_work_sync(&phy->scan_work);
++		return;
++	}
+ 
+ 	mt7615_mutex_acquire(dev);
+ 
+@@ -254,16 +262,16 @@
+ 
+ 	mt7615_mutex_acquire(dev);
+ 
+-	mt7615_mcu_add_bss_info(phy, vif, NULL, false);
+-	mt7615_mcu_sta_add(phy, vif, NULL, false);
+-
+-	mt76_testmode_reset(phy->mt76, true);
++	if (!mt76_dma_failed(&dev->mt76)) {
++		mt7615_mcu_add_bss_info(phy, vif, NULL, false);
++		mt7615_mcu_sta_add(phy, vif, NULL, false);
++		mt76_testmode_reset(phy->mt76, true);
++		mt7615_mcu_add_dev_info(phy, vif, false);
++	}
+ 	if (vif == phy->monitor_vif)
+ 	    phy->monitor_vif = NULL;
+ 
+ 	mt76_connac_free_pending_tx_skbs(&dev->pm, &msta->wcid);
+-
+-	mt7615_mcu_add_dev_info(phy, vif, false);
+ 
+ 	rcu_assign_pointer(dev->mt76.wcid[idx], NULL);
+ 
+@@ -374,6 +382,14 @@
+ 		return -EOPNOTSUPP;
+ 	}
+ 
++	if (mt76_dma_failed(&dev->mt76)) {
++		if (cmd == SET_KEY)
++			return -EIO;
++		if (idx == *wcid_keyidx)
++			*wcid_keyidx = -1;
++		return 0;
++	}
++
+ 	mt7615_mutex_acquire(dev);
+ 
+ 	if (cmd == SET_KEY && !sta && !mvif->mt76.cipher) {
+@@ -426,6 +442,9 @@
+ 	struct mt7615_phy *phy = mt7615_hw_phy(hw);
+ 	bool band = phy != &dev->phy;
+ 	int ret = 0;
++
++	if (mt76_dma_failed(&dev->mt76))
++		return -EIO;
+ 
+ 	if (changed & (IEEE80211_CONF_CHANGE_CHANNEL |
+ 		       IEEE80211_CONF_CHANGE_POWER)) {
+@@ -466,6 +485,9 @@
+ 	struct mt7615_dev *dev = mt7615_hw_dev(hw);
+ 	int err;
+ 
++	if (mt76_dma_failed(&dev->mt76))
++		return -EIO;
++
+ 	mt7615_mutex_acquire(dev);
+ 
+ 	queue = mt7615_lmac_mapping(dev, queue);
+@@ -492,6 +514,9 @@
+ 			MT_WF_RFCR1_DROP_CFEND |
+ 			MT_WF_RFCR1_DROP_CFACK;
+ 	u32 flags = 0;
++
++	if (mt76_dma_failed(&dev->mt76))
++		return;
+ 
+ 	mt7615_mutex_acquire(dev);
+ 
+@@ -572,6 +597,9 @@
+ 	struct mt7615_dev *dev = mt7615_hw_dev(hw);
+ 	struct mt7615_phy *phy = mt7615_hw_phy(hw);
+ 
++	if (mt76_dma_failed(&dev->mt76))
++		return;
++
+ 	mt7615_mutex_acquire(dev);
+ 
+ 	if (changed & BSS_CHANGED_ERP_SLOT) {
+@@ -624,6 +652,9 @@
+ 			     struct cfg80211_chan_def *chandef)
+ {
+ 	struct mt7615_dev *dev = mt7615_hw_dev(hw);
++
++	if (mt76_dma_failed(&dev->mt76))
++		return;
+ 
+ 	mt7615_mutex_acquire(dev);
+ 	mt7615_mcu_add_beacon(dev, hw, vif, true);
+@@ -683,6 +714,8 @@
+ 	mt76_connac_free_pending_tx_skbs(&dev->pm, &msta->wcid);
+ 
+ 	phy = mvif->mt76.band_idx ? mt7615_ext_phy(dev) : &dev->phy;
++	if (mt76_dma_failed(mdev))
++		goto remove_poll;
+ 	mt76_connac_pm_wake(phy->mt76, &dev->pm);
+ 
+ 	mt7615_mcu_sta_add(&dev->phy, vif, sta, false);
+@@ -691,6 +724,7 @@
+ 	if (vif->type == NL80211_IFTYPE_STATION && !sta->tdls)
+ 		mt7615_mcu_add_bss_info(phy, vif, sta, false);
+ 
++remove_poll:
+ 	spin_lock_bh(&mdev->sta_poll_lock);
+ 	if (!list_empty(&msta->wcid.poll_list))
+ 		list_del_init(&msta->wcid.poll_list);
+@@ -734,6 +768,9 @@
+ {
+ 	struct mt7615_dev *dev = container_of(w, struct mt7615_dev,
+ 					      mt76.tx_worker);
++
++	if (READ_ONCE(dev->removing) || mt76_dma_failed(&dev->mt76))
++		return;
+ 
+ 	if (!mt76_connac_pm_ref(&dev->mphy, &dev->pm)) {
+ 		queue_work(dev->mt76.wq, &dev->pm.wake_work);
+@@ -755,6 +792,11 @@
+ 	struct mt76_wcid *wcid = &dev->mt76.global_wcid;
+ 	struct mt7615_sta *msta = NULL;
+ 	int qid;
++
++	if (READ_ONCE(dev->removing) || mt76_dma_failed(&dev->mt76)) {
++		ieee80211_free_txskb(hw, skb);
++		return;
++	}
+ 
+ 	if (control->sta) {
+ 		msta = (struct mt7615_sta *)control->sta->drv_priv;
+@@ -815,6 +857,23 @@
+ 		return -EINVAL;
+ 
+ 	mtxq = (struct mt76_txq *)txq->drv_priv;
++
++	if (mt76_dma_failed(&dev->mt76)) {
++		switch (action) {
++		case IEEE80211_AMPDU_RX_STOP:
++			mt76_rx_aggr_stop(&dev->mt76, &msta->wcid, tid);
++			return 0;
++		case IEEE80211_AMPDU_TX_STOP_CONT:
++			ieee80211_stop_tx_ba_cb_irqsafe(vif, sta->addr, tid);
++			fallthrough;
++		case IEEE80211_AMPDU_TX_STOP_FLUSH:
++		case IEEE80211_AMPDU_TX_STOP_FLUSH_CONT:
++			mtxq->aggr = false;
++			return 0;
++		default:
++			return -EIO;
++		}
++	}
+ 
+ 	mt7615_mutex_acquire(dev);
+ 
+@@ -1197,6 +1256,9 @@
+ 	del_timer_sync(&phy->roc_timer);
+ 	cancel_work_sync(&phy->roc_work);
+ 
++	if (mt76_dma_failed(&phy->dev->mt76))
++		return 0;
++
+ 	mt7615_mutex_acquire(phy->dev);
+ 	err = mt7615_mcu_set_roc(phy, vif, NULL, 0);
+ 	mt7615_mutex_release(phy->dev);
+@@ -1219,7 +1281,8 @@
+ 	else
+ 		clear_bit(MT_WCID_FLAG_HDR_TRANS, &msta->wcid.flags);
+ 
+-	mt7615_mcu_set_sta_decap_offload(dev, vif, sta);
++	if (!mt76_dma_failed(&dev->mt76))
++		mt7615_mcu_set_sta_decap_offload(dev, vif, sta);
+ 
+ 	mt7615_mutex_release(dev);
+ }
+@@ -1261,6 +1324,9 @@
+ 	struct mt7615_dev *dev = mt7615_hw_dev(hw);
+ 	unsigned long timeout;
+ 	bool running;
++
++	if (mt76_dma_failed(&dev->mt76))
++		return -EIO;
+ 
+ 	mt7615_mutex_acquire(dev);
+ 
+--- a/mt7615/mmio.c
++++ b/mt7615/mmio.c
+@@ -73,6 +73,8 @@
+ {
+ 	struct mt7615_dev *dev = dev_instance;
+ 
++	if (mt76_dma_failed(&dev->mt76))
++		return IRQ_NONE;
+ 	mt76_wr(dev, MT_INT_MASK_CSR, 0);
+ 
+ 	if (!test_bit(MT76_STATE_INITIALIZED, &dev->mphy.state))
+@@ -89,9 +91,15 @@
+ 	u32 intr, mask = 0, tx_mcu_mask = mt7615_tx_mcu_int_mask(dev);
+ 	u32 mcu_int;
+ 
++	if (mt76_dma_failed(&dev->mt76))
++		return;
+ 	mt76_wr(dev, MT_INT_MASK_CSR, 0);
+ 
+ 	intr = mt76_rr(dev, MT_INT_SOURCE_CSR);
++	if (intr == U32_MAX) {
++		mt7615_dma_fail(dev, "invalid interrupt status", intr);
++		return;
++	}
+ 	intr &= dev->mt76.mmio.irqmask;
+ 	mt76_wr(dev, MT_INT_SOURCE_CSR, intr);
+ 
+@@ -116,14 +124,22 @@
+ 
+ 	if (is_mt7663(&dev->mt76)) {
+ 		mcu_int = mt76_rr(dev, MT_MCU2HOST_INT_STATUS);
++		if (mcu_int == U32_MAX) {
++			mt7615_dma_fail(dev, "invalid MCU interrupt status", mcu_int);
++			return;
++		}
+ 		mcu_int &= MT7663_MCU_CMD_ERROR_MASK;
+ 		mt76_wr(dev, MT_MCU2HOST_INT_STATUS, mcu_int);
+ 	} else {
+ 		mcu_int = mt76_rr(dev, MT_MCU_CMD);
++		if (mcu_int == U32_MAX) {
++			mt7615_dma_fail(dev, "invalid MCU command status", mcu_int);
++			return;
++		}
+ 		mcu_int &= MT_MCU_CMD_ERROR_MASK;
+ 	}
+ 
+-	if (!mcu_int)
++	if (!mcu_int || READ_ONCE(dev->removing))
+ 		return;
+ 
+ 	dev->reset_state = mcu_int;
+@@ -142,7 +158,11 @@
+ static u32 mt7615_rr(struct mt76_dev *mdev, u32 offset)
+ {
+ 	struct mt7615_dev *dev = container_of(mdev, struct mt7615_dev, mt76);
+-	u32 addr = __mt7615_reg_addr(dev, offset);
++	u32 addr;
++
++	if (mt76_dma_failed(mdev))
++		return U32_MAX;
++	addr = __mt7615_reg_addr(dev, offset);
+ 
+ 	return dev->bus_ops->rr(mdev, addr);
+ }
+@@ -150,7 +170,11 @@
+ static void mt7615_wr(struct mt76_dev *mdev, u32 offset, u32 val)
+ {
+ 	struct mt7615_dev *dev = container_of(mdev, struct mt7615_dev, mt76);
+-	u32 addr = __mt7615_reg_addr(dev, offset);
++	u32 addr;
++
++	if (mt76_dma_failed(mdev))
++		return;
++	addr = __mt7615_reg_addr(dev, offset);
+ 
+ 	dev->bus_ops->wr(mdev, addr, val);
+ }
+@@ -158,7 +182,11 @@
+ static u32 mt7615_rmw(struct mt76_dev *mdev, u32 offset, u32 mask, u32 val)
+ {
+ 	struct mt7615_dev *dev = container_of(mdev, struct mt7615_dev, mt76);
+-	u32 addr = __mt7615_reg_addr(dev, offset);
++	u32 addr;
++
++	if (mt76_dma_failed(mdev))
++		return U32_MAX;
++	addr = __mt7615_reg_addr(dev, offset);
+ 
+ 	return dev->bus_ops->rmw(mdev, addr, mask, val);
+ }
+@@ -179,6 +207,7 @@
+ 		.rx_check = mt7615_rx_check,
+ 		.rx_skb = mt7615_queue_rx_skb,
+ 		.rx_poll_complete = mt7615_rx_poll_complete,
++		.dma_error = mt7615_dma_error,
+ 		.sta_add = mt7615_mac_sta_add,
+ 		.sta_remove = mt7615_mac_sta_remove,
+ 		.update_survey = mt7615_update_channel,
+@@ -197,6 +226,11 @@
+ 	mdev = mt76_alloc_device(pdev, sizeof(*dev), ops, &drv_ops);
+ 	if (!mdev)
+ 		return -ENOMEM;
++	ret = mt76_dma_owner_init(mdev);
++	if (ret) {
++		mt76_free_device(mdev);
++		return ret;
++	}
+ 
+ 	dev = container_of(mdev, struct mt7615_dev, mt76);
+ 	mt76_mmio_init(&dev->mt76, mem_base);
+@@ -227,6 +261,8 @@
+ 			       IRQF_SHARED, KBUILD_MODNAME, dev);
+ 	if (ret)
+ 		goto err_free_dev;
++	dev->irq = irq;
++	dev->irq_requested = true;
+ 
+ 	if (is_mt7663(mdev))
+ 		mt76_wr(dev, MT_PCIE_IRQ_ENABLE, 1);
+@@ -238,8 +274,10 @@
+ 	return 0;
+ 
+ err_free_irq:
+-	devm_free_irq(pdev, irq, dev);
++	mt7615_unregister_device(dev);
++	return ret;
+ err_free_dev:
++	tasklet_kill(&mdev->irq_tasklet);
+ 	mt76_free_device(&dev->mt76);
+ 
+ 	return ret;
+--- a/mt7615/mt7615.h
++++ b/mt7615/mt7615.h
+@@ -258,6 +258,11 @@
+ 	struct work_struct mcu_work;
+ 
+ 	struct work_struct reset_work;
++	struct work_struct dma_error_work;
++	bool dma_error_ready;
++	bool removing;
++	int irq;
++	bool irq_requested;
+ 	wait_queue_head_t reset_wait;
+ 	u32 reset_state;
+ 
+@@ -403,8 +408,18 @@
+ int mt7615_mcu_set_wmm(struct mt7615_dev *dev, u8 queue,
+ 		       const struct ieee80211_tx_queue_params *params);
+ void mt7615_mcu_rx_event(struct mt7615_dev *dev, struct sk_buff *skb);
++void mt7615_dma_error(struct mt76_dev *mdev);
++void mt7615_dma_error_work(struct work_struct *work);
++int mt7615_dma_stop_checked(struct mt7615_dev *dev);
+ int mt7615_mcu_rdd_send_pattern(struct mt7615_dev *dev);
+ int mt7615_mcu_fw_log_2_host(struct mt7615_dev *dev, u8 ctrl);
++
++static inline void mt7615_dma_fail(struct mt7615_dev *dev,
++				 const char *reason, u32 value)
++{
++	if (mt76_dma_set_failed(&dev->mt76))
++		dev_err(dev->mt76.dev, "%s: %#x; device recovery stopped\n", reason, value);
++}
+ 
+ static inline bool mt7615_firmware_offload(struct mt7615_dev *dev)
+ {
+@@ -421,8 +436,13 @@
+ 
+ #define mt7615_mutex_acquire(dev)	\
+ 	mt76_connac_mutex_acquire(&(dev)->mt76, &(dev)->pm)
+-#define mt7615_mutex_release(dev)	\
+-	mt76_connac_mutex_release(&(dev)->mt76, &(dev)->pm)
++static inline void mt7615_mutex_release(struct mt7615_dev *dev)
++{
++	if (mt76_dma_failed(&dev->mt76))
++		mutex_unlock(&dev->mt76.mutex);
++	else
++		mt76_connac_mutex_release(&dev->mt76, &dev->pm);
++}
+ 
+ static inline u8 mt7615_lmac_mapping(struct mt7615_dev *dev, u8 ac)
+ {
+@@ -450,7 +470,7 @@
+ 	return dev->pm.enable ? HZ / 3 : HZ / 10;
+ }
+ 
+-void mt7615_dma_reset(struct mt7615_dev *dev);
++int mt7615_dma_reset(struct mt7615_dev *dev);
+ void mt7615_scan_work(struct work_struct *work);
+ void mt7615_roc_work(struct work_struct *work);
+ void mt7615_roc_timer(struct timer_list *timer);
+--- a/mt7615/pci.c
++++ b/mt7615/pci.c
+@@ -25,6 +25,8 @@
+ 	const u32 *map;
+ 	int ret;
+ 
++	if (mt76_dma_device_busy(&pdev->dev))
++		return -EBUSY;
+ 	ret = pcim_enable_device(pdev);
+ 	if (ret)
+ 		return ret;
+@@ -64,7 +66,6 @@
+ 	struct mt7615_dev *dev = container_of(mdev, struct mt7615_dev, mt76);
+ 
+ 	mt7615_unregister_device(dev);
+-	devm_free_irq(&pdev->dev, pdev->irq, dev);
+ 	pci_free_irq_vectors(pdev);
+ }
+ 
+@@ -76,6 +77,8 @@
+ 	bool hif_suspend;
+ 	int i, err;
+ 
++	if (mt76_dma_failed(mdev))
++		return -EIO;
+ 	err = mt76_connac_pm_wake(&dev->mphy, &dev->pm);
+ 	if (err < 0)
+ 		return err;
+@@ -94,9 +97,12 @@
+ 	mt76_for_each_q_rx(mdev, i) {
+ 		napi_disable(&mdev->napi[i]);
+ 	}
++	mdev->dma_napi_disabled = true;
+ 	tasklet_kill(&mdev->irq_tasklet);
+ 
+-	mt7615_dma_reset(dev);
++	err = mt7615_dma_reset(dev);
++	if (err)
++		goto restore;
+ 
+ 	err = mt7615_wait_pdma_busy(dev);
+ 	if (err)
+@@ -130,6 +136,7 @@
+ 		napi_enable(&mdev->napi[i]);
+ 	}
+ 	napi_enable(&mdev->tx_napi);
++	mdev->dma_napi_disabled = false;
+ 	if (hif_suspend)
+ 		mt76_connac_mcu_set_hif_suspend(mdev, false, true);
+ 
+@@ -143,6 +150,8 @@
+ 	bool pdma_reset;
+ 	int i, err;
+ 
++	if (mt76_dma_failed(mdev))
++		return -EIO;
+ 	err = mt7615_mcu_set_drv_ctrl(dev);
+ 	if (err < 0)
+ 		return err;
+@@ -169,6 +178,7 @@
+ 		napi_enable(&mdev->napi[i]);
+ 	}
+ 	napi_enable(&mdev->tx_napi);
++	mdev->dma_napi_disabled = false;
+ 
+ 	local_bh_disable();
+ 	mt76_for_each_q_rx(mdev, i) {
+--- a/mt7615/pci_init.c
++++ b/mt7615/pci_init.c
+@@ -37,7 +37,6 @@
+ 
+ 	mt76_wr(dev, MT_INT_SOURCE_CSR, ~0);
+ 
+-	INIT_WORK(&dev->mcu_work, mt7615_pci_init_work);
+ 	ret = mt7615_eeprom_init(dev, addr);
+ 	if (ret < 0)
+ 		return ret;
+@@ -72,6 +71,9 @@
+ 
+ 	mt7615_init_device(dev);
+ 	INIT_WORK(&dev->reset_work, mt7615_mac_reset_work);
++	INIT_WORK(&dev->dma_error_work, mt7615_dma_error_work);
++	INIT_WORK(&dev->mcu_work, mt7615_pci_init_work);
++	smp_store_release(&dev->dma_error_ready, true);
+ 
+ 	/* init led callbacks */
+ 	if (IS_ENABLED(CONFIG_MT76_LEDS)) {
+@@ -109,20 +111,118 @@
+ 	return mt7615_init_debugfs(dev);
+ }
+ 
++static void mt7615_cancel_phy_work(struct mt7615_phy *phy)
++{
++	if (!phy)
++		return;
++	cancel_delayed_work_sync(&phy->mt76->mac_work);
++	cancel_delayed_work_sync(&phy->scan_work);
++	timer_shutdown_sync(&phy->roc_timer);
++	cancel_work_sync(&phy->roc_work);
++	if (test_bit(MT76_STATE_REGISTERED, &phy->mt76->state))
++		cancel_delayed_work_sync(&phy->mt76->roc_work);
++	skb_queue_purge(&phy->scan_event_list);
++}
++
++static void mt7615_stop_data_tx(struct mt7615_dev *dev)
++{
++	struct mt76_dev *mdev = &dev->mt76;
++	int i, j;
++
++	/* Keep MCU_RESET clear until the exit command has completed. */
++	for (i = 0; i < ARRAY_SIZE(mdev->phys); i++) {
++		struct mt76_phy *phy = mdev->phys[i];
++
++		if (!phy)
++			continue;
++		set_bit(MT76_RESET, &phy->state);
++		if (test_bit(MT76_STATE_REGISTERED, &phy->state))
++			ieee80211_stop_queues(phy->hw);
++	}
++	mt76_worker_disable(&mdev->tx_worker);
++	/* Drain submissions already past their state check, including PS
++	 * delivery outside the TX worker. Later data queue entries see RESET.
++	 */
++	for (i = 0; i < ARRAY_SIZE(mdev->phys); i++) {
++		struct mt76_phy *phy = mdev->phys[i];
++
++		if (!phy)
++			continue;
++		for (j = 0; j < ARRAY_SIZE(phy->q_tx); j++) {
++			struct mt76_queue *q = phy->q_tx[j];
++
++			if (!q)
++				continue;
++			spin_lock_bh(&q->lock);
++			spin_unlock_bh(&q->lock);
++		}
++	}
++}
++
+ void mt7615_unregister_device(struct mt7615_dev *dev)
+ {
+-	bool mcu_running;
+-
+-	mcu_running = mt7615_wait_for_mcu_init(dev);
++	struct mt76_dev *mdev = &dev->mt76;
++
++	WRITE_ONCE(dev->removing, true);
++	/* All these works are initialized before register_device can fail. */
++	cancel_work_sync(&dev->reset_work);
++	cancel_work_sync(&dev->dma_error_work);
++	mt7615_stop_data_tx(dev);
++	cancel_work_sync(&dev->mcu_work);
++	mt7615_cancel_phy_work(&dev->phy);
++	mt7615_cancel_phy_work(mt7615_ext_phy(dev));
++	cancel_delayed_work_sync(&dev->pm.ps_work);
++	cancel_work_sync(&dev->pm.wake_work);
++	cancel_delayed_work_sync(&dev->coredump.work);
++	cancel_delayed_work_sync(&mdev->scan_work);
++
++	if (!mt76_dma_failed(mdev) &&
++	    test_bit(MT76_STATE_MCU_RUNNING, &dev->mphy.state))
++		mt7615_mcu_exit(dev);
++
++	/* No further firmware transactions or bus wrapper accesses. The sole
++	 * exception is the bounded, raw DMA-stop attempt below.
++	 */
++	set_bit(MT76_DMA_ERROR, &mdev->phy.state);
++	mt7615_dma_error(mdev);
++	dev->bus_ops->wr(mdev, MT_INT_MASK_CSR, 0);
++	if (dev->irq_requested) {
++		devm_free_irq(mdev->dev, dev->irq, dev);
++		dev->irq_requested = false;
++	}
++	tasklet_kill(&mdev->irq_tasklet);
++	/* An IRQ tasklet that passed its admission check before removing was
++	 * set may have queued recovery after the first cancellation. Drain it
++	 * only after synchronizing that producer, before permanent NAPI stop.
++	 */
++	cancel_work_sync(&dev->reset_work);
++	cancel_work_sync(&dev->dma_error_work);
++	cancel_delayed_work_sync(&dev->pm.ps_work);
++	cancel_work_sync(&dev->pm.wake_work);
++	mt76_dma_stop_napi(mdev);
++	/* NAPI is the last possible generic DMA-error notification producer. */
++	cancel_work_sync(&dev->dma_error_work);
++	if (mt7615_dma_stop_checked(dev))
++		mt76_dma_quarantine(mdev);
+ 
+ 	mt7615_unregister_ext_phy(dev);
+-	mt76_unregister_device(&dev->mt76);
+-	if (mcu_running)
+-		mt7615_mcu_exit(dev);
+-
+-	mt7615_tx_token_put(dev);
+-	mt7615_dma_cleanup(dev);
+-	tasklet_disable(&dev->mt76.irq_tasklet);
+-
+-	mt76_free_device(&dev->mt76);
+-}
++	mt76_unregister_device(mdev);
++	/* unregister callbacks may have queued software work; drain again
++	 * while their workqueues still exist, then retire DMA-owned objects.
++	 */
++	mt7615_cancel_phy_work(&dev->phy);
++	cancel_delayed_work_sync(&dev->pm.ps_work);
++	cancel_work_sync(&dev->pm.wake_work);
++	cancel_delayed_work_sync(&dev->coredump.work);
++	cancel_delayed_work_sync(&mdev->scan_work);
++	skb_queue_purge(&mdev->mcu.res_q);
++	skb_queue_purge(&dev->coredump.msg_list);
++	mt76_connac_free_pending_tx_skbs(&dev->pm, NULL);
++
++	if (!mdev->dma_quarantined) {
++		mt7615_tx_token_put(dev);
++		mt7615_dma_cleanup(dev);
++	}
++
++	mt76_free_device(mdev);
++}
+--- a/mt7615/pci_mac.c
++++ b/mt7615/pci_mac.c
+@@ -111,28 +111,124 @@
+ 	return 0;
+ }
+ 
+-void mt7615_dma_reset(struct mt7615_dev *dev)
+-{
++int mt7615_dma_stop_checked(struct mt7615_dev *dev)
++{
++	u32 value, enabled = MT_WPDMA_GLO_CFG_RX_DMA_EN |
++		MT_WPDMA_GLO_CFG_TX_DMA_EN | MT_WPDMA_GLO_CFG_TX_WRITEBACK_DONE;
++	u32 busy = MT_WPDMA_GLO_CFG_RX_DMA_BUSY | MT_WPDMA_GLO_CFG_TX_DMA_BUSY;
+ 	int i;
+ 
+-	mt76_clear(dev, MT_WPDMA_GLO_CFG,
+-		   MT_WPDMA_GLO_CFG_RX_DMA_EN | MT_WPDMA_GLO_CFG_TX_DMA_EN |
+-		   MT_WPDMA_GLO_CFG_TX_WRITEBACK_DONE);
+-
+-	usleep_range(1000, 2000);
+-
+-	for (i = 0; i < __MT_TXQ_MAX; i++)
++	dev->mt76.dma_quiesced = false;
++	if (!dev->bus_ops || !dev->reg_map)
++		return -EIO;
++	/* These control registers have fixed BAR offsets. The ordinary bus
++	 * wrappers deliberately reject access after a fault; only this stop
++	 * attempt may use the underlying bus, including after the fault latch.
++	 */
++	value = dev->bus_ops->rr(&dev->mt76, MT_WPDMA_GLO_CFG);
++	if (value == U32_MAX)
++		goto failed;
++	dev->bus_ops->wr(&dev->mt76, MT_WPDMA_GLO_CFG, value & ~enabled);
++	for (i = 0; i < 1000; i++) {
++		usleep_range(1000, 2000);
++		value = dev->bus_ops->rr(&dev->mt76, MT_WPDMA_GLO_CFG);
++		if (value == U32_MAX)
++			goto failed;
++		if (!(value & (enabled | busy))) {
++			dev->mt76.dma_quiesced = true;
++			return 0;
++		}
++	}
++failed:
++	mt7615_dma_fail(dev, "DMA stop could not be verified", value);
++	return -EIO;
++}
++
++void mt7615_dma_error(struct mt76_dev *mdev)
++{
++	struct mt7615_dev *dev = container_of(mdev, struct mt7615_dev, mt76);
++
++	set_bit(MT76_RESET, &dev->mphy.state);
++	set_bit(MT76_MCU_RESET, &dev->mphy.state);
++	mt76_set_irq_mask(mdev, 0, ~0U, 0);
++	wake_up(&mdev->mcu.wait);
++	if (!smp_load_acquire(&dev->dma_error_ready))
++		return;
++	wake_up(&dev->reset_wait);
++	if (!READ_ONCE(dev->removing) &&
++	    test_bit(MT76_STATE_REGISTERED, &mdev->phy.state))
++		queue_work(mdev->wq, &dev->dma_error_work);
++}
++
++void mt7615_dma_error_work(struct work_struct *work)
++{
++	struct mt7615_dev *dev = container_of(work, struct mt7615_dev, dma_error_work);
++	struct mt76_phy *ext = dev->mt76.phys[MT_BAND1];
++
++	if (READ_ONCE(dev->removing))
++		return;
++	ieee80211_stop_queues(mt76_hw(dev));
++	if (ext) {
++		set_bit(MT76_RESET, &ext->state);
++		ieee80211_stop_queues(ext->hw);
++	}
++	/* reset_work runs on this ordered queue; it has already returned and
++	 * balanced its NAPI disables before this one-shot fault work can run.
++	 */
++	mt76_worker_disable(&dev->mt76.tx_worker);
++	cancel_delayed_work_sync(&dev->mphy.mac_work);
++	del_timer_sync(&dev->phy.roc_timer);
++	cancel_work_sync(&dev->phy.roc_work);
++	cancel_delayed_work_sync(&dev->phy.scan_work);
++	cancel_delayed_work_sync(&dev->pm.ps_work);
++	cancel_work_sync(&dev->pm.wake_work);
++	if (ext) {
++		struct mt7615_phy *phy = ext->priv;
++
++		cancel_delayed_work_sync(&ext->mac_work);
++		del_timer_sync(&phy->roc_timer);
++		cancel_work_sync(&phy->roc_work);
++		cancel_delayed_work_sync(&phy->scan_work);
++	}
++	mutex_lock(&dev->mt76.mutex);
++	dev->bus_ops->wr(&dev->mt76, MT_INT_MASK_CSR, 0);
++	mt7615_dma_stop_checked(dev);
++	mutex_unlock(&dev->mt76.mutex);
++}
++
++int mt7615_dma_reset(struct mt7615_dev *dev)
++{
++	int i, ret;
++
++	/* An unreadable control word is not evidence that DMA has stopped.
++	 * Do not unmap outstanding buffers or rewrite descriptors in that case.
++	 */
++	ret = mt7615_dma_stop_checked(dev);
++	if (ret)
++		return ret;
++
++	for (i = 0; i < __MT_TXQ_MAX; i++) {
+ 		mt76_queue_tx_cleanup(dev, dev->mphy.q_tx[i], true);
+-
+-	for (i = 0; i < __MT_MCUQ_MAX; i++)
++		if (mt76_dma_failed(&dev->mt76))
++			return -EIO;
++	}
++
++	for (i = 0; i < __MT_MCUQ_MAX; i++) {
+ 		mt76_queue_tx_cleanup(dev, dev->mt76.q_mcu[i], true);
+-
+-	mt76_for_each_q_rx(&dev->mt76, i)
++		if (mt76_dma_failed(&dev->mt76))
++			return -EIO;
++	}
++
++	mt76_for_each_q_rx(&dev->mt76, i) {
+ 		mt76_queue_rx_reset(dev, i);
++		if (mt76_dma_failed(&dev->mt76))
++			return -EIO;
++	}
+ 
+ 	mt76_tx_status_check(&dev->mt76, true);
+ 
+ 	mt7615_dma_start(dev);
++	return mt76_dma_failed(&dev->mt76) ? -EIO : 0;
+ }
+ EXPORT_SYMBOL_GPL(mt7615_dma_reset);
+ 
+@@ -156,8 +252,11 @@
+ 	bool ret;
+ 
+ 	ret = wait_event_timeout(dev->reset_wait,
++				 mt76_dma_failed(&dev->mt76) ||
+ 				 (READ_ONCE(dev->reset_state) & state),
+ 				 MT7615_RESET_TIMEOUT);
++	if (mt76_dma_failed(&dev->mt76))
++		return false;
+ 	WARN(!ret, "Timeout waiting for MCU reset state %x\n", state);
+ 	return ret;
+ }
+@@ -203,13 +302,15 @@
+ 	struct mt76_phy *ext_phy;
+ 	struct mt7615_dev *dev;
+ 	unsigned long timeout;
++	bool napi_enabled = false;
+ 	int i;
+ 
+ 	dev = container_of(work, struct mt7615_dev, reset_work);
+ 	ext_phy = dev->mt76.phys[MT_BAND1];
+ 	phy2 = ext_phy ? ext_phy->priv : NULL;
+ 
+-	if (!(READ_ONCE(dev->reset_state) & MT_MCU_CMD_STOP_PDMA))
++	if (READ_ONCE(dev->removing) || mt76_dma_failed(&dev->mt76) ||
++	    !(READ_ONCE(dev->reset_state) & MT_MCU_CMD_STOP_PDMA))
+ 		return;
+ 
+ 	ieee80211_stop_queues(mt76_hw(dev));
+@@ -240,11 +341,14 @@
+ 	napi_disable(&dev->mt76.tx_napi);
+ 
+ 	mt7615_mutex_acquire(dev);
++	if (mt76_dma_failed(&dev->mt76))
++		goto failed;
+ 
+ 	mt7615_hif_int_event_trigger(dev, MT_MCU_INT_EVENT_PDMA_STOPPED);
+ 
+ 	if (mt7615_wait_reset_state(dev, MT_MCU_CMD_RESET_DONE)) {
+-		mt7615_dma_reset(dev);
++		if (mt7615_dma_reset(dev))
++			goto failed;
+ 
+ 		mt7615_tx_token_put(dev);
+ 		idr_init(&dev->mt76.token);
+@@ -252,34 +356,37 @@
+ 		mt76_wr(dev, MT_WPDMA_MEM_RNG_ERR, 0);
+ 
+ 		mt7615_hif_int_event_trigger(dev, MT_MCU_INT_EVENT_PDMA_INIT);
+-		mt7615_wait_reset_state(dev, MT_MCU_CMD_RECOVERY_DONE);
+-	}
++		if (!mt7615_wait_reset_state(dev, MT_MCU_CMD_RECOVERY_DONE))
++			goto failed;
++	} else {
++		goto failed;
++	}
++
++	napi_enable(&dev->mt76.tx_napi);
++	mt76_for_each_q_rx(&dev->mt76, i) {
++		napi_enable(&dev->mt76.napi[i]);
++	}
++	napi_enabled = true;
++
++	local_bh_disable();
++	napi_schedule(&dev->mt76.tx_napi);
++	mt76_for_each_q_rx(&dev->mt76, i) {
++		napi_schedule(&dev->mt76.napi[i]);
++	}
++	local_bh_enable();
++
++	mt7615_hif_int_event_trigger(dev, MT_MCU_INT_EVENT_RESET_DONE);
++	if (!mt7615_wait_reset_state(dev, MT_MCU_CMD_NORMAL_STATE))
++		goto failed;
+ 
+ 	clear_bit(MT76_MCU_RESET, &dev->mphy.state);
+ 	clear_bit(MT76_RESET, &dev->mphy.state);
+ 	if (phy2)
+ 		clear_bit(MT76_RESET, &phy2->mt76->state);
+-
+ 	mt76_worker_enable(&dev->mt76.tx_worker);
+-
+-	napi_enable(&dev->mt76.tx_napi);
+-	mt76_for_each_q_rx(&dev->mt76, i) {
+-		napi_enable(&dev->mt76.napi[i]);
+-	}
+-
+-	local_bh_disable();
+-	napi_schedule(&dev->mt76.tx_napi);
+-	mt76_for_each_q_rx(&dev->mt76, i) {
+-		napi_schedule(&dev->mt76.napi[i]);
+-	}
+-	local_bh_enable();
+-
+ 	ieee80211_wake_queues(mt76_hw(dev));
+ 	if (ext_phy)
+ 		ieee80211_wake_queues(ext_phy->hw);
+-
+-	mt7615_hif_int_event_trigger(dev, MT_MCU_INT_EVENT_RESET_DONE);
+-	mt7615_wait_reset_state(dev, MT_MCU_CMD_NORMAL_STATE);
+ 
+ 	mt7615_update_beacons(dev);
+ 
+@@ -291,5 +398,27 @@
+ 	if (phy2)
+ 		ieee80211_queue_delayed_work(ext_phy->hw,
+ 					     &phy2->mt76->mac_work, timeout);
+-
+-}
++	return;
++
++failed:
++	ieee80211_stop_queues(mt76_hw(dev));
++	if (ext_phy)
++		ieee80211_stop_queues(ext_phy->hw);
++	mt76_worker_disable(&dev->mt76.tx_worker);
++	if (napi_enabled) {
++		napi_disable(&dev->mt76.tx_napi);
++		mt76_for_each_q_rx(&dev->mt76, i)
++			napi_disable(&dev->mt76.napi[i]);
++	}
++	mt7615_dma_stop_checked(dev);
++	mt7615_dma_fail(dev, "firmware recovery failed", READ_ONCE(dev->reset_state));
++	if (phy2)
++		set_bit(MT76_RESET, &phy2->mt76->state);
++	/* Balance disables for later teardown, without scheduling any work.
++	 * The persistent fault blocks queue access and IRQ rearming.
++	 */
++	napi_enable(&dev->mt76.tx_napi);
++	mt76_for_each_q_rx(&dev->mt76, i)
++		napi_enable(&dev->mt76.napi[i]);
++	mt7615_mutex_release(dev);
++}
+--- a/mt7615/soc.c
++++ b/mt7615/soc.c
+@@ -34,6 +34,8 @@
+ 	void __iomem *mem_base;
+ 	int irq;
+ 
++	if (mt76_dma_device_busy(&pdev->dev))
++		return -EBUSY;
+ 	irq = platform_get_irq(pdev, 0);
+ 	if (irq < 0)
+ 		return irq;
+--- a/mt76_connac.h
++++ b/mt76_connac.h
+@@ -332,6 +332,8 @@
+ 
+ static inline void mt76_connac_irq_enable(struct mt76_dev *dev, u32 mask)
+ {
++	if (mt76_dma_failed(dev))
++		return;
+ 	mt76_set_irq_mask(dev, 0, 0, mask);
+ 	tasklet_schedule(&dev->irq_tasklet);
+ }
+--- a/mt76_connac_mac.c
++++ b/mt76_connac_mac.c
+@@ -36,6 +36,9 @@
+ int mt76_connac_pm_wake(struct mt76_phy *phy, struct mt76_connac_pm *pm)
+ {
+ 	struct mt76_dev *dev = phy->dev;
++
++	if (mt76_dma_failed(dev))
++		return -EIO;
+ 
+ 	if (mt76_is_usb(dev))
+ 		return 0;
+@@ -63,6 +66,9 @@
+ 				  struct mt76_connac_pm *pm)
+ {
+ 	struct mt76_dev *dev = phy->dev;
++
++	if (mt76_dma_failed(dev))
++		return;
+ 
+ 	if (mt76_is_usb(dev))
+ 		return;
+--- a/wed.c
++++ b/wed.c
+@@ -119,8 +119,16 @@
+ 		/* WED txfree queue needs ring to be initialized before setup */
+ 		q->flags = 0;
+ 		mt76_dma_queue_reset(dev, q, true);
++		if (mt76_dma_failed(dev)) {
++			ret = -EIO;
++			goto restore_flags;
++		}
+ 		mt76_dma_rx_fill(dev, q, false);
+ 
++		if (mt76_dma_failed(dev)) {
++			ret = -EIO;
++			goto restore_flags;
++		}
+ 		ret = mtk_wed_device_txfree_ring_setup(q->wed, q->regs);
+ 		if (!ret)
+ 			q->wed_regs = q->wed->txfree_ring.reg_base;
+@@ -134,6 +142,10 @@
+ 	case MT76_WED_RRO_Q_DATA:
+ 		q->flags &= ~MT_QFLAG_WED;
+ 		mt76_dma_queue_reset(dev, q, false);
++		if (mt76_dma_failed(dev)) {
++			ret = -EIO;
++			goto restore_flags;
++		}
+ 		mtk_wed_device_rro_rx_ring_setup(q->wed, ring, q->regs);
+ 		q->head = q->ndesc - 1;
+ 		q->queued = q->head;
+@@ -141,6 +153,10 @@
+ 	case MT76_WED_RRO_Q_MSDU_PG:
+ 		q->flags &= ~MT_QFLAG_WED;
+ 		mt76_dma_queue_reset(dev, q, false);
++		if (mt76_dma_failed(dev)) {
++			ret = -EIO;
++			goto restore_flags;
++		}
+ 		mtk_wed_device_msdu_pg_rx_ring_setup(q->wed, ring, q->regs);
+ 		q->head = q->ndesc - 1;
+ 		q->queued = q->head;
+@@ -148,13 +164,22 @@
+ 	case MT76_WED_RRO_Q_IND:
+ 		q->flags &= ~MT_QFLAG_WED;
+ 		mt76_dma_queue_reset(dev, q, true);
++		if (mt76_dma_failed(dev)) {
++			ret = -EIO;
++			goto restore_flags;
++		}
+ 		mt76_dma_rx_fill(dev, q, false);
++		if (mt76_dma_failed(dev)) {
++			ret = -EIO;
++			goto restore_flags;
++		}
+ 		mtk_wed_device_ind_rx_ring_setup(q->wed, q->regs);
+ 		break;
+ 	default:
+ 		ret = -EINVAL;
+ 		break;
+ 	}
++restore_flags:
+ 	q->flags = flags;
+ 
+ 	return ret;

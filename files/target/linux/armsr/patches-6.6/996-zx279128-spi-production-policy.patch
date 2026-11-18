@@ -1,0 +1,24 @@
+--- a/drivers/spi/Kconfig
++++ b/drivers/spi/Kconfig
+@@ -1164,6 +1164,21 @@
+ 	  Native SPI-mem transport for the ZX279128S boot flash controller.
+ 	  The initial qualification implementation refuses array writes.
+ 
++config SPI_ZX279128_PRODUCTION_POLICY
++	bool "H199A production write policy"
++	depends on SPI_ZX279128=y
++	default n
++	help
++	  Compile the ZTE ZXHN H199A production write allowlist into the
++	  transport: program/erase only bank A [0x00700000,0x01740000) and
++	  the UBI overlay window [0x05400000,0x06400000), refuse every other
++	  physical row and any feature write that changes the array mode, and
++	  latch the first refusal until reboot. It is selected at boot with
++	  spi_zx279128.production=1, or production_qualify=1 which also
++	  refuses bank A for RAM-only qualification. Without either option
++	  the transport keeps refusing all array writes. Say N for
++	  diagnostic and RAM-qualification images.
++
+ config SPI_ZYNQ_QSPI
+ 	tristate "Xilinx Zynq QSPI controller"
+ 	depends on ARCH_ZYNQ || COMPILE_TEST

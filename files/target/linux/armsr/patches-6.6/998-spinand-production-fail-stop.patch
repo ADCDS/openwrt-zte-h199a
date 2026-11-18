@@ -1,0 +1,83 @@
+--- a/drivers/mtd/nand/spi/Kconfig
++++ b/drivers/mtd/nand/spi/Kconfig
+@@ -18,3 +18,17 @@
+ 	  failure. Built-in support and suppressed bind attributes keep the
+ 	  failure latch alive until reboot. Normal operation is unchanged when
+ 	  the option is not selected at boot. Say N in production builds.
++
++config MTD_SPI_NAND_FAIL_STOP
++	bool "SPI NAND production mutation fail-stop"
++	depends on MTD_SPI_NAND=y && !MTD_SPI_NAND_DIAGNOSTIC
++	default n
++	help
++	  Always-on production form of the qualification guard. Bad-block
++	  marking is refused, the first program or erase failure latches and
++	  every later program/erase returns -EROFS until reboot, and sysfs
++	  bind/unbind is suppressed so the latch cannot be reset. A flash
++	  node with "partitioned-master-read-only" also loses write
++	  permission on the partitioned master after its partitions have
++	  inherited it, so only partitions left writable by the device tree
++	  can be programmed or erased.
+--- a/include/linux/mtd/spinand.h
++++ b/include/linux/mtd/spinand.h
+@@ -439,6 +439,11 @@
+ 	int diagnostic_errno;
+ 	loff_t diagnostic_offset;
+ #endif
++#ifdef CONFIG_MTD_SPI_NAND_FAIL_STOP
++	bool failstop_latched;
++	int failstop_errno;
++	loff_t failstop_offset;
++#endif
+ 
+ 	struct {
+ 		const struct spi_mem_op *read_cache;
+--- a/drivers/mtd/nand/spi/core.c
++++ b/drivers/mtd/nand/spi/core.c
+@@ -1392,6 +1392,19 @@
+ 	if (ret)
+ 		goto err_spinand_cleanup;
+ 
++#ifdef CONFIG_MTD_SPI_NAND_FAIL_STOP
++	/* Partitions copied MTD_WRITEABLE when they were registered. Withdraw
++	 * it from the partitioned master, so the only writable devices are the
++	 * partitions the device tree leaves writable.
++	 */
++	if (of_property_read_bool(mem->spi->dev.of_node,
++				  "partitioned-master-read-only")) {
++		mtd->flags &= ~MTD_WRITEABLE;
++		dev_info(&mem->spi->dev,
++			 "partitioned master read-only; partitions keep device-tree permissions\n");
++	}
++#endif
++
+ 	return 0;
+ 
+ err_spinand_cleanup:
+@@ -1437,7 +1450,8 @@
+ 		.id_table = spinand_ids,
+ 		.driver = {
+ 			.name = "spi-nand",
+-			.suppress_bind_attrs = IS_ENABLED(CONFIG_MTD_SPI_NAND_DIAGNOSTIC),
++			.suppress_bind_attrs = IS_ENABLED(CONFIG_MTD_SPI_NAND_DIAGNOSTIC) ||
++					       IS_ENABLED(CONFIG_MTD_SPI_NAND_FAIL_STOP),
+ 			.of_match_table = of_match_ptr(spinand_of_ids),
+ 		},
+ 	},
+--- a/Documentation/devicetree/bindings/mtd/spi-nand.yaml
++++ b/Documentation/devicetree/bindings/mtd/spi-nand.yaml
+@@ -25,6 +25,14 @@
+       during initialization and resume. Volatile configuration needed for
+       reads, such as on-die ECC selection, remains permitted.
+ 
++  partitioned-master-read-only:
++    type: boolean
++    description: |
++      With CONFIG_MTD_SPI_NAND_FAIL_STOP, remove write permission from the
++      partitioned master device after its partitions have been registered.
++      Partitions keep the permission given by their own read-only property,
++      so the master cannot be used to program or erase around them.
++
+   reg:
+     description: Encode the chip-select line on the SPI bus
+     maxItems: 1

@@ -1,0 +1,140 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/spi/zte,zx279128s-spifc.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: ZTE ZX279128S SPI flash controller (spifc)
+
+maintainers:
+  - TBD
+
+description: |
+  Command-based SPI memory controller used for the boot SPI-NAND. Each
+  operation is described by opcode, address, count and configuration
+  registers, with a FIFO at +0x38. It has a single chip select and supports
+  single-bit transmit with single- or dual-bit receive. It has no host ECC
+  engine, so ECC is left to the flash's on-die engine.
+
+  The driver (drivers/spi/spi-zx279128.c) runs the controller at the rate of
+  the "wclk" clock it inherits and cannot change the SCK divider. A child
+  device whose spi-max-frequency differs from that rate is rejected
+  (-EINVAL). On the H199A that rate is 50 MHz.
+
+  The write allowlist (CONFIG_SPI_ZX279128_PRODUCTION_POLICY and the
+  write_test, ubi_test, production and production_qualify module
+  parameters) is not described in the device tree and is out of scope here.
+
+  The former raw-NAND shim was removed from this recipe. Its historical
+  layout is not a supported alternative to the SPI-mem child model.
+
+allOf:
+  - $ref: spi-controller.yaml#
+
+properties:
+  compatible:
+    const: zte,zx279128s-spifc
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+    description:
+      Controller interrupt (SPI 13). TODO - the SPI-mem driver polls and does
+      not request it. The diagnostic raw-NAND driver requested it and never
+      saw it fire. The enable bit has not been found (docs/NAND.md).
+
+  clocks:
+    items:
+      - description: Peripheral (register interface) clock
+      - description: SPI working clock. SCK runs at this rate.
+
+  clock-names:
+    items:
+      - const: pclk
+      - const: wclk
+
+  '#address-cells':
+    const: 1
+
+  '#size-cells':
+    const: 0
+
+patternProperties:
+  "^flash@[0-9a-f]+$":
+    type: object
+    properties:
+      reg:
+        description: The controller has a single chip select.
+        const: 0
+
+      spi-rx-bus-width:
+        enum: [1, 2]
+
+      spi-tx-bus-width:
+        const: 1
+
+required:
+  - compatible
+  - reg
+  - clocks
+  - clock-names
+  - '#address-cells'
+  - '#size-cells'
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/clock/zte,zx279128s-crm.h>
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+
+    spi@94406000 {
+        compatible = "zte,zx279128s-spifc";
+        reg = <0x94406000 0x1000>;
+        interrupts = <GIC_SPI 13 IRQ_TYPE_LEVEL_HIGH>;
+        clocks = <&crm ZX_CRM_SPI_PCLK>, <&crm ZX_CRM_SPI_WCLK>;
+        clock-names = "pclk", "wclk";
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        flash@0 {
+            compatible = "spi-nand";
+            reg = <0>;
+            spi-max-frequency = <50000000>;
+            spi-rx-bus-width = <2>;
+
+            /* Trimmed. The full table is in zx279128s-zte-h199a.dts. */
+            partitions {
+                compatible = "fixed-partitions";
+                #address-cells = <1>;
+                #size-cells = <1>;
+
+                partition@0 {
+                    label = "bootloader";
+                    reg = <0x0000000 0x0100000>;
+                    read-only;
+                };
+
+                partition@100000 {
+                    compatible = "nvmem-cells";
+                    label = "tag";
+                    reg = <0x0100000 0x0100000>;
+                    read-only;
+                    #address-cells = <1>;
+                    #size-cells = <1>;
+
+                    macaddr@1e {
+                        reg = <0x1e 0x6>;
+                    };
+                };
+
+                partition@a00000 {
+                    label = "rootfs";
+                    reg = <0x0a00000 0x0d20000>;
+                };
+            };
+        };
+    };
+...

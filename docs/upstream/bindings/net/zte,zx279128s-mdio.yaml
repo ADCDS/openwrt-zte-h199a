@@ -1,0 +1,84 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/net/zte,zx279128s-mdio.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: ZTE ZX279128S MDIO bus controller
+
+maintainers:
+  - TBD
+
+description: |
+  MDIO (clause 22) master that reaches the on-board GE PHYs. The register
+  map was recovered from the vendor U-Boot: write data at +0x04, read data
+  at +0x08, a status register at +0x10 (bit 0 = transfer done) and control
+  at +0x14 (bit 14 start, bits 11:10 opcode, bits 9:5 PHY address,
+  bits 4:0 register). Completion is polled. The block has no interrupt.
+
+  The driver (drivers/net/mdio/mdio-zx279128.c) maps reg[0] and registers
+  the bus with of_mdiobus_register(), so PHY child nodes follow mdio.yaml.
+  The compatible string matches the stock vendor DT.
+
+  TODO: at probe the driver also ioremaps Ethernet MAC, BM and TM registers
+  at fixed addresses to print a debug dump, and scans all 32 addresses. That
+  code has to go before upstreaming. It does not affect this binding.
+
+allOf:
+  - $ref: mdio.yaml#
+
+properties:
+  compatible:
+    const: zte,zx279128s-mdio
+
+  reg:
+    maxItems: 1
+
+  clocks:
+    items:
+      - description: Register clock (LSP1CRPM + 0x04 bit 0)
+      - description:
+          MDC working clock (LSP1CRPM + 0x04 bit 1). The stock tree names
+          only this one, as clock 1 of its lsp1crpm node.
+
+  clock-names:
+    items:
+      - const: pclk
+      - const: wclk
+
+required:
+  - compatible
+  - reg
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/clock/zte,zx279128s-crm.h>
+
+    mdio@9a101000 {
+        compatible = "zte,zx279128s-mdio";
+        reg = <0x9a101000 0x18>;
+        clocks = <&crm ZX_CRM_MDIO_PCLK>, <&crm ZX_CRM_MDIO_WCLK>;
+        clock-names = "pclk", "wclk";
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        /* Four on-board GE PHYs, ID 84b9:5031, at addresses 10-13. */
+        ethernet-phy@a {
+            reg = <10>;
+        };
+
+        ethernet-phy@b {
+            reg = <11>;
+        };
+
+        ethernet-phy@c {
+            reg = <12>;
+        };
+
+        ethernet-phy@d {
+            reg = <13>;
+        };
+    };
+...

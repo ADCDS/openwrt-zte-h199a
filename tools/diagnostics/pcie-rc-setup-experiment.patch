@@ -1,0 +1,66 @@
+--- a/drivers/pci/controller/dwc/pcie-zx279128.c
++++ b/drivers/pci/controller/dwc/pcie-zx279128.c
+@@ -141,6 +141,7 @@
+ 	unsigned int		perst_pin;
+ 	bool			serdes_override;
+ 	bool trace_writes;
++	bool stop_ltssm_for_setup;
+ 	raw_spinlock_t trace_lock;
+ 	u64 trace_total;
+ 	u64 trace_route_count[2];
+@@ -447,8 +448,13 @@
+ static int zx_pcie_link_up(struct dw_pcie *pci)
+ {
+ 	struct zx_pcie *zx = to_zx_pcie(pci);
+-	u32 val = readl(zx->glue + ZX_GLUE_LTSSM);
+-
++	u32 val;
++
++	/* A stopped FSM may retain its last state. Force fresh start after setup. */
++	if (zx->stop_ltssm_for_setup &&
++	    !(readl(zx->glue + ZX_GLUE_CTRL) & ZX_GLUE_LTSSM_EN))
++		return 0;
++	val = readl(zx->glue + ZX_GLUE_LTSSM);
+ 	return FIELD_GET(ZX_LTSSM_STATE, val) == ZX_LTSSM_L0;
+ }
+ 
+@@ -536,6 +542,14 @@
+ 
+ static int zx_pcie_start_link(struct dw_pcie *pci)
+ {
++	struct zx_pcie *zx = to_zx_pcie(pci);
++
++	if (zx->stop_ltssm_for_setup)
++		dev_info(pci->dev,
++			 "private start_link after RC setup: ctrl=%08x link=%08x width=%08x\n",
++			 readl(zx->glue + ZX_GLUE_CTRL),
++			 dw_pcie_readl_dbi(pci, PCIE_PORT_LINK_CONTROL),
++			 dw_pcie_readl_dbi(pci, PCIE_LINK_WIDTH_SPEED_CONTROL));
+ 	/* Both domains and PERST lines are already prepared. Never reset the
+ 	 * shared fabric here: the peer may already have published its bus.
+ 	 */
+@@ -970,6 +984,24 @@
+ 	ret = zx_pcie_prepare_pair(zx);
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "shared PCIe preparation failed\n");
++	if (!zx->port && of_property_read_bool(dev->of_node,
++					     "zte,stop-ltssm-before-rc-setup")) {
++		u32 ctrl = readl(zx->glue + ZX_GLUE_CTRL);
++		u32 state = FIELD_GET(ZX_LTSSM_STATE,
++				      readl(zx->glue + ZX_GLUE_LTSSM));
++
++		if ((ctrl & ZX_GLUE_LTSSM_EN) && state == ZX_LTSSM_L0) {
++			dev_info(dev, "private RC ordering control skipped: initial link already L0\n");
++		} else {
++			/* Own host is unpublished. No GPIO/CRM/peer operation. */
++			zx->stop_ltssm_for_setup = true;
++			writel(ctrl & ~ZX_GLUE_LTSSM_EN, zx->glue + ZX_GLUE_CTRL);
++			if (readl(zx->glue + ZX_GLUE_CTRL) & ZX_GLUE_LTSSM_EN)
++				return dev_err_probe(dev, -EIO, "cannot stop LTSSM before RC setup\n");
++			udelay(10);
++			dev_info(dev, "private LTSSM held off before DWC root setup\n");
++		}
++	}
+ 	ret = devm_device_add_group(dev, &zx_pcie_group);
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "cannot publish PCIe link observations\n");

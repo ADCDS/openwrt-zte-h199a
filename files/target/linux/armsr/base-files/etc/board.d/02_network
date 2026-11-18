@@ -1,0 +1,40 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+. /lib/functions/system.sh
+. /lib/functions/uci-defaults.sh
+
+board_config_update
+
+case "$(board_name)" in
+	zte,zx279128s|zte,zxhn-h199a)
+		# The four GE jacks are eth0..eth3 == mac0..mac3 == MDIO address
+		# 10..13. The driver guarantees that mapping by naming each
+		# netdev from its physical port index rather than from
+		# registration order, so these names do not depend on which port
+		# the device tree binds as primary.
+		#
+		# mac3/phy3 is the jack the vendor labels WAN. Measured by
+		# driving the MDIO controller by hand from U-Boot and reading
+		# each PHY's BMSR - see docs/ETHERNET.md, "PHY / MAC / jack map".
+		#
+		# Every port must end up in a firewall zone. A per-port netdev
+		# in no zone is silently eaten by fw4's default input DROP while
+		# its rx counters keep climbing, which reads exactly like a
+		# broken datapath and cost an hour to find.
+		#
+		# MAC addresses are NOT set here. They come from the `tag` flash
+		# partition through nvmem cells in the device tree, which is the
+		# single source of truth; adding a second writer here is what
+		# made the address non-deterministic on the dir842 port.
+		ucidef_set_interfaces_lan_wan "eth0 eth1 eth2" "eth3"
+		;;
+	traverse,ten64)
+		ucidef_set_interface_lan "eth0 eth1 eth2 eth3"
+		ucidef_set_interface_wan "eth6"
+		;;
+esac
+
+board_config_flush
+
+exit 0
